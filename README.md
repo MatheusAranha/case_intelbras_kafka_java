@@ -135,11 +135,29 @@ cd case_intelbras_kafka_java
 
 (If you already have it locally, just `cd` into the folder instead.)
 
+### Fastest path: three scripts
+
+If you just want this running with minimal typing:
+
+```bash
+./setup.sh   # checks Docker is installed/running, builds and pulls every image
+./run.sh     # starts everything, triggers the demo ingestion, prints the URLs/results
+./test.sh    # runs the full test suite locally (unit tests + the Testcontainers integration test)
+```
+
+`./run.sh` ends by printing exactly what Step 4–5 below show manually (the audit count,
+the metrics, the Grafana URL). The rest of this section walks through the same thing
+by hand, one command at a time, so you can see what each script is actually doing and
+interact with the running app directly.
+
 ### Step 2 — Start everything
 
 ```bash
 docker compose up -d --build
 ```
+
+(This is exactly what `./run.sh` does first, plus the health-wait and demo trigger
+below — use whichever you prefer.)
 
 This single command builds the application image and starts five containers: Kafka,
 Postgres, the application, Prometheus, and Grafana. The first run takes a minute or two
@@ -293,6 +311,8 @@ containers — separate from the `docker compose` stack above, so you don't need
 that first).
 
 ```bash
+./test.sh
+# or, equivalently:
 mvn test
 ```
 
@@ -320,6 +340,7 @@ completely fresh (empty audit trail, as if this were the first run ever).
 
 ## Reference
 
+- **Scripts**: `./setup.sh` (check prerequisites, build/pull images), `./run.sh` (start everything, trigger the demo, print URLs/results), `./test.sh` (run the full test suite locally).
 - **Architecture**: `ARCHITECTURE.md`
 - **Decisions & trade-offs**: `DECISIONS.md`
 - **Coding conventions**: `CLAUDE.md`
