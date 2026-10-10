@@ -223,7 +223,7 @@ public void execute(IncomingDeviceEvent event, KafkaMessageContext kafkaCtx) {
 - **NEVER** call `logger.info`/`logger.error`/`System.out` directly inside a use case, listener, or controller — always go through `ExecutionLog`.
 - **NEVER** log a step before the action it describes has executed.
 - Pass the same `ExecutionLog` instance down to private helper methods so they can add their own steps — the terminal `.info()`/`.error()` call still happens only once, at the top-level behaviour.
-- This applies to **behaviours** (use case `execute()`, listener `onMessage`, controller handler methods) — not to every tiny private getter/mapper. A helper that just transforms data doesn't need its own `ExecutionLog`; it receives the caller's and appends steps.
+- This applies to **behaviours that contain logic** — use case `execute()` methods, principally. It does **not** apply to Kafka listeners or REST controllers: those are thin delegators (deserialize/extract context, call a use case, map the response) with no decision-making of their own. The use case they call already emits the one `ExecutionLog` for that request, including the Kafka topic/partition/offset/key context the listener passed in. Giving a listener or controller its own `ExecutionLog` on top of that would double log volume per request with no new signal. **Decided explicitly**: only use cases log; listeners and controllers never call `ExecutionLog` directly. A helper that just transforms data doesn't need its own `ExecutionLog` either; it receives the caller's and appends steps.
 
 ---
 
