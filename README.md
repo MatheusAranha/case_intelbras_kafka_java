@@ -7,8 +7,8 @@ in an independent `audit` domain with retry and dead-letter handling, persists a
 trail in Postgres, and exposes it over REST — observable via Prometheus and Grafana.
 
 This README has two parts: a **project review** (what was built, how, and how it was
-validated) and a **step-by-step "for dummies" guide** to actually run it, use it, and
-test it, assuming no prior familiarity with this codebase.
+validated) and a **step-by-step guide** to actually run it, use it, and test it,
+assuming no prior familiarity with this codebase.
 
 ---
 
@@ -26,9 +26,8 @@ test it, assuming no prior familiarity with this codebase.
 | RT01–RT04 — Java, Kafka, clear responsibilities, error handling | hexagonal architecture, see below |
 | RT05 — idempotency / duplicate handling | `eventId` dedup key + DB unique constraint, proven in `AuditFlowIT` |
 | RT06 — automated tests | 43 tests: unit (no infra) + Testcontainers integration test |
-| Bloco A (implementation) | this codebase |
-| Bloco B (architecture) | `ARCHITECTURE.md` |
-| Bloco C (decisions & trade-offs) | `DECISIONS.md` |
+| Architecture write-up (scaling, partitioning, consumer groups, ordering, idempotency, retry, observability, fault tolerance) | `ARCHITECTURE.md` |
+| Technical decisions & trade-offs | `DECISIONS.md` |
 | Bonus: git history, Docker Compose, metrics/observability, Kafka integration tests | all four done — see below |
 
 ### Architecture at a glance
@@ -321,8 +320,8 @@ completely fresh (empty audit trail, as if this were the first run ever).
 
 ## Reference
 
-- **Architecture (Bloco B)**: `ARCHITECTURE.md`
-- **Decisions & trade-offs (Bloco C)**: `DECISIONS.md`
+- **Architecture**: `ARCHITECTURE.md`
+- **Decisions & trade-offs**: `DECISIONS.md`
 - **Coding conventions**: `CLAUDE.md`
 - **Design spec**: `docs/superpowers/specs/2026-10-10-iot-device-event-kafka-design.md`
 - **REST API**:
