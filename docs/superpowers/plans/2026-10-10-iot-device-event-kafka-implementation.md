@@ -2,50 +2,42 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the Intelbras case backend: a Spring Boot app that ingests IoT device events from a CSV, publishes them to Kafka (topic-per-device-type), consumes them in an independent `audit` domain with idempotent, retried, dead-lettered processing, persists an audit trail in Postgres, and exposes it over REST — fully observable and tested.
+**Goal:** Build the Intelbras case backend: ingest the real 100-event CSV (plus 4 labeled synthetic rows for the DLQ demo), publish to Kafka (topic-per-`EventCategory`, derived from the real `msgType` field), consume in an independent `audit` domain with idempotent, retried, dead-lettered processing, persist an audit trail in Postgres, expose it over REST — observable and tested.
 
-**Architecture:** Hexagonal, domain-per-feature (`domains/device`, `domains/audit`), each with a framework-free `core/` and a Spring-wired `adapters/`. Cross-domain communication happens only through the Kafka wire JSON, never shared Java types. See CLAUDE.md for the conventions every task below follows (naming, the one-log-per-behaviour `ExecutionLog` pattern, one-branch-per-task git workflow).
+**Architecture:** Hexagonal, domain-per-feature (`domains/device`, `domains/audit`), each with a framework-free `core/` and a Spring-wired `adapters/`. Cross-domain communication happens only through the Kafka wire JSON. See CLAUDE.md for conventions (naming, `ExecutionLog`, one-branch-per-task git workflow).
 
-**Tech Stack:** Java 21, Maven, Spring Boot 3.3.4 (web, kafka, data-jpa, actuator), PostgreSQL + Flyway, Apache Kafka (KRaft), Micrometer + Prometheus + Grafana, JUnit 5 + Mockito + Testcontainers (Kafka, Postgres) + Awaitility, Docker Compose.
+**Tech Stack:** Java 21, Maven, Spring Boot 3.3.4 (web, kafka, data-jpa, actuator), PostgreSQL + Flyway, Apache Kafka (KRaft), Micrometer + Prometheus + Grafana, JUnit 5 + Mockito + Testcontainers + Awaitility, Docker Compose.
 
-**Spec:** `docs/superpowers/specs/2026-10-10-iot-device-event-kafka-design.md`
+**Spec:** `docs/superpowers/specs/2026-10-10-iot-device-event-kafka-design.md` (revised for the real dataset).
 
 ## Global Constraints
 
 - Java 21, Maven, Spring Boot 3.3.4 parent, package root `com.intelbras.iotevents`.
-- `core/` packages: zero Spring/Kafka/JPA imports, unit-testable with no infra running.
-- No cross-domain Java imports: `audit` never imports `device.core.*`. Only the Kafka JSON message crosses the boundary.
-- Ports are Java interfaces in `core/port/`, implemented by `adapters/`, wired by standard Spring autowiring (constructor injection, no manual composition root).
-- Topics: `device.camera.events`, `device.sensor.events`, `device.alarm.events`, `device.generic.events` — 3 partitions each, keyed by `deviceId`. DLT per topic: `<topic>.DLT`, 1 partition.
-- Consumer group: `audit-service`, concurrency 3 per listener.
-- Duplicates (dedup key already seen): log only, no audit row, no error.
-- Failures (handler throws): retry with backoff, then dead-letter + log only — no audit row, no `status` field on `AuditRecord` at all.
-- Every behaviour (use case `execute()`, listener `onMessage`, controller handler) emits exactly one `ExecutionLog` terminal call (`info` or `error`), never zero, never more than one. See CLAUDE.md "Logging" section for the full pattern and the `ExecutionLog`/`LogStep` shapes — every task below follows it verbatim.
-- Git: every task starts on its own branch off `main` (`{type}/{kebab-case-description}`), merges back to `main` only after its tests pass; commit messages are the message only, no trailers.
+- `core/` packages: zero Spring/Kafka/JPA imports.
+- No cross-domain Java imports: `audit` never imports `device.core.*`.
+- Ports are Java interfaces in `core/port/`, standard Spring autowiring.
+- Classification is `EventCategory` (`PROPERTY_CHANGE`, `STATUS_CHANGE`, `MOTION_DETECTION`, `OTHER`), derived from the real `msgType` field — NOT a fabricated device type.
+- Topics: `device.property-change.events`, `device.status-change.events`, `device.motion-detection.events`, `device.other.events` — 3 partitions each, keyed by `deviceId`. DLT per topic: `<topic>.DLT`.
+- Consumer group `audit-service`, concurrency 3 per listener.
+- Duplicates: log only, no audit row. Failures: log + DLQ only, no audit row, no `status` field on `AuditRecord`.
+- The real CSV (`case_information/case_backend_senior_eventos_sanitizados 1.csv`, 100 rows) is copied into `src/main/resources/events.csv` with 4 appended synthetic rows (`SYNTHETIC-DLQ-001..004`, one per category, `simulateFailure: true`) to demonstrate the DLQ path without fabricating a failure inside real data.
+- Timestamp source is the CSV's `timestamp_log` column, parsed via `OffsetDateTime.parse(...).toInstant()` (NOT `Instant.parse` — the format uses explicit `+00:00` offsets).
+- Dedup id resolution order: `body_completo.id` → `body_completo.alarmId` → hash(deviceId, eventType, timestampRaw, payload).
+- Every behaviour emits exactly one `ExecutionLog` terminal call. Git: one branch per task, merge after tests pass, commit messages are the message only, no trailers.
 
 ---
 
 ### Task 1: Project bootstrap
 
 **Files:**
-- Create: `pom.xml`
-- Create: `src/main/resources/application.yml`
-- Create: `src/main/java/com/intelbras/iotevents/IotEventsApplication.java`
+- Create: `pom.xml`, `src/main/resources/application.yml`, `src/main/java/com/intelbras/iotevents/IotEventsApplication.java`, `docker-compose.yml`
 - Modify: `.gitignore`
-- Create: `docker-compose.yml`
 
-**Interfaces:**
-- Produces: a compilable Maven project; `application.yml` properties (`spring.datasource.*`, `spring.kafka.*`, `server.port`) that every later task's Spring beans rely on; `docker-compose.yml` services `kafka` and `postgres` that later tasks' adapters connect to locally.
+**Interfaces:** Produces a compilable Maven project and `application.yml` properties every later task's beans rely on; `docker-compose.yml` services `kafka`/`postgres` for local dev.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b chore/project-bootstrap`
 
-```bash
-git checkout main
-git pull --ff-only || true
-git checkout -b chore/project-bootstrap
-```
-
-- [ ] **Step 2: Write `pom.xml`**
+- [ ] **Step 2: `pom.xml`**
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -53,97 +45,37 @@ git checkout -b chore/project-bootstrap
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
-
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
         <version>3.3.4</version>
         <relativePath/>
     </parent>
-
     <groupId>com.intelbras</groupId>
     <artifactId>iot-events</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>iot-events</name>
     <description>Intelbras IoT device event processing case</description>
-
     <properties>
         <java.version>21</java.version>
     </properties>
-
     <dependencies>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.kafka</groupId>
-            <artifactId>spring-kafka</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-jpa</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>io.micrometer</groupId>
-            <artifactId>micrometer-registry-prometheus</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.postgresql</groupId>
-            <artifactId>postgresql</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.flywaydb</groupId>
-            <artifactId>flyway-core</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.flywaydb</groupId>
-            <artifactId>flyway-database-postgresql</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.commons</groupId>
-            <artifactId>commons-csv</artifactId>
-            <version>1.11.0</version>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.kafka</groupId>
-            <artifactId>spring-kafka-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>kafka</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>postgresql</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.awaitility</groupId>
-            <artifactId>awaitility</artifactId>
-            <version>4.2.2</version>
-            <scope>test</scope>
-        </dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+        <dependency><groupId>org.springframework.kafka</groupId><artifactId>spring-kafka</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
+        <dependency><groupId>io.micrometer</groupId><artifactId>micrometer-registry-prometheus</artifactId></dependency>
+        <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency>
+        <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId></dependency>
+        <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-database-postgresql</artifactId></dependency>
+        <dependency><groupId>org.apache.commons</groupId><artifactId>commons-csv</artifactId><version>1.11.0</version></dependency>
+        <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.springframework.kafka</groupId><artifactId>spring-kafka-test</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.testcontainers</groupId><artifactId>junit-jupiter</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.testcontainers</groupId><artifactId>kafka</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.testcontainers</groupId><artifactId>postgresql</artifactId><scope>test</scope></dependency>
+        <dependency><groupId>org.awaitility</groupId><artifactId>awaitility</artifactId><version>4.2.2</version><scope>test</scope></dependency>
     </dependencies>
-
     <dependencyManagement>
         <dependencies>
             <dependency>
@@ -155,24 +87,19 @@ git checkout -b chore/project-bootstrap
             </dependency>
         </dependencies>
     </dependencyManagement>
-
     <build>
         <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-            </plugin>
+            <plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId></plugin>
         </plugins>
     </build>
 </project>
 ```
 
-- [ ] **Step 3: Write `src/main/resources/application.yml`**
+- [ ] **Step 3: `src/main/resources/application.yml`**
 
 ```yaml
 server:
   port: 8080
-
 spring:
   application:
     name: iot-events
@@ -197,7 +124,6 @@ spring:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       auto-offset-reset: earliest
-
 management:
   endpoints:
     web:
@@ -209,7 +135,7 @@ management:
         enabled: true
 ```
 
-- [ ] **Step 4: Write the main class**
+- [ ] **Step 4: Main class**
 
 ```java
 package com.intelbras.iotevents;
@@ -225,9 +151,7 @@ public class IotEventsApplication {
 }
 ```
 
-- [ ] **Step 5: Update `.gitignore`**
-
-Add these lines to the existing `.gitignore`:
+- [ ] **Step 5: `.gitignore`** — append:
 
 ```
 # Maven
@@ -239,15 +163,14 @@ target/
 .vscode/
 ```
 
-- [ ] **Step 6: Write `docker-compose.yml` (Kafka + Postgres only for now — app/observability services added in later tasks)**
+- [ ] **Step 6: `docker-compose.yml`** (Kafka + Postgres only; app/observability added in Task 16)
 
 ```yaml
 services:
   kafka:
     image: apache/kafka:3.8.0
     container_name: iotevents-kafka
-    ports:
-      - "9092:9092"
+    ports: ["9092:9092"]
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -257,64 +180,34 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-
   postgres:
     image: postgres:16-alpine
     container_name: iotevents-postgres
-    ports:
-      - "5432:5432"
+    ports: ["5432:5432"]
     environment:
       POSTGRES_DB: iotevents
       POSTGRES_USER: iotevents
       POSTGRES_PASSWORD: iotevents
-    volumes:
-      - iotevents-postgres-data:/var/lib/postgresql/data
-
+    volumes: ["iotevents-postgres-data:/var/lib/postgresql/data"]
 volumes:
   iotevents-postgres-data:
 ```
 
-- [ ] **Step 7: Verify the project compiles**
-
-Run: `mvn -q -DskipTests compile`
-Expected: `BUILD SUCCESS`, no output beyond Maven's normal lifecycle logging.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add pom.xml src/main/resources/application.yml src/main/java/com/intelbras/iotevents/IotEventsApplication.java .gitignore docker-compose.yml
-git commit -m "chore: bootstrap Spring Boot project skeleton"
-```
-
-- [ ] **Step 9: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff chore/project-bootstrap
-git branch -d chore/project-bootstrap
-```
+- [ ] **Step 7: Verify compile** — `mvn -q -DskipTests compile` → `BUILD SUCCESS`
+- [ ] **Step 8: Commit** — `git add pom.xml src/main/resources/application.yml src/main/java/com/intelbras/iotevents/IotEventsApplication.java .gitignore docker-compose.yml && git commit -m "chore: bootstrap Spring Boot project skeleton"`
+- [ ] **Step 9: Merge** — `git checkout main && git merge --no-ff chore/project-bootstrap && git branch -d chore/project-bootstrap`
 
 ---
 
 ### Task 2: Common structured logging (`ExecutionLog`)
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/common/logging/LogStep.java`
-- Create: `src/main/java/com/intelbras/iotevents/common/logging/ExecutionLog.java`
-- Create: `src/main/java/com/intelbras/iotevents/common/logging/StructuredLogger.java`
-- Test: `src/test/java/com/intelbras/iotevents/common/logging/ExecutionLogTest.java`
+**Files:** Create `common/logging/{LogStep,ExecutionLog,StructuredLogger}.java`; Test `ExecutionLogTest.java`.
 
-**Interfaces:**
-- Produces: `ExecutionLog.start(Class<?> module, String method)`, `.context(String, Object)`, `.step(String)`, `.step(String, Map<String,Object>)`, `.info(String)`, `.error(String, Throwable)`. Every use case, listener, and controller task from here on depends on this exact API.
+**Interfaces:** `ExecutionLog.start(Class<?>, String)`, `.context(String,Object)`, `.step(String[, Map])`, `.info(String)`, `.error(String, Throwable)`. Every later use case/listener/controller depends on this.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/execution-log`
 
-```bash
-git checkout main
-git checkout -b feat/execution-log
-```
-
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 2: Failing test**
 
 ```java
 package com.intelbras.iotevents.common.logging;
@@ -359,33 +252,23 @@ class ExecutionLogTest {
         log.info("Completed successfully");
 
         assertThat(appender.list).hasSize(1);
-        assertThat(appender.list.get(0).getFormattedMessage()).contains("Completed successfully");
-        assertThat(appender.list.get(0).getFormattedMessage()).contains("evt-1");
-        assertThat(appender.list.get(0).getFormattedMessage()).contains("Did something else");
+        assertThat(appender.list.get(0).getFormattedMessage()).contains("Completed successfully", "evt-1", "Did something else");
     }
 
     @Test
     void shouldEmitExactlyOneErrorLineOnFailurePath() {
-        ExecutionLog log = ExecutionLog.start(ExecutionLogTest.class, "execute")
-            .context("eventId", "evt-2")
-            .step("Attempted something");
-
-        RuntimeException boom = new RuntimeException("boom");
-        log.error("Failed", boom);
+        ExecutionLog log = ExecutionLog.start(ExecutionLogTest.class, "execute").context("eventId", "evt-2");
+        log.error("Failed", new RuntimeException("boom"));
 
         assertThat(appender.list).hasSize(1);
-        assertThat(appender.list.get(0).getFormattedMessage()).contains("Failed");
-        assertThat(appender.list.get(0).getFormattedMessage()).contains("evt-2");
+        assertThat(appender.list.get(0).getFormattedMessage()).contains("Failed", "evt-2");
     }
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [ ] **Step 3: Run, verify fails** — `mvn -q test -Dtest=ExecutionLogTest`
 
-Run: `mvn -q test -Dtest=ExecutionLogTest`
-Expected: FAIL — `ExecutionLog`, `LogStep`, `StructuredLogger` do not exist yet.
-
-- [ ] **Step 4: Write `LogStep`**
+- [ ] **Step 4: `LogStep`**
 
 ```java
 package com.intelbras.iotevents.common.logging;
@@ -396,7 +279,7 @@ public record LogStep(String message, Map<String, Object> data) {
 }
 ```
 
-- [ ] **Step 5: Write `StructuredLogger`**
+- [ ] **Step 5: `StructuredLogger`**
 
 ```java
 package com.intelbras.iotevents.common.logging;
@@ -410,6 +293,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 final class StructuredLogger {
@@ -422,19 +306,17 @@ final class StructuredLogger {
     }
 
     static void info(String message, String module, String method, Instant startedAt,
-                      Map<String, Object> context, java.util.List<LogStep> steps) {
-        Logger logger = LoggerFactory.getLogger(module);
-        logger.info(render(message, module, method, startedAt, context, steps, null));
+                      Map<String, Object> context, List<LogStep> steps) {
+        LoggerFactory.getLogger(module).info(render(message, module, method, startedAt, context, steps, null));
     }
 
     static void error(String message, String module, String method, Instant startedAt,
-                       Map<String, Object> context, java.util.List<LogStep> steps, Throwable error) {
-        Logger logger = LoggerFactory.getLogger(module);
-        logger.error(render(message, module, method, startedAt, context, steps, error), error);
+                       Map<String, Object> context, List<LogStep> steps, Throwable error) {
+        LoggerFactory.getLogger(module).error(render(message, module, method, startedAt, context, steps, error), error);
     }
 
     private static String render(String message, String module, String method, Instant startedAt,
-                                  Map<String, Object> context, java.util.List<LogStep> steps, Throwable error) {
+                                  Map<String, Object> context, List<LogStep> steps, Throwable error) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("message", message);
         payload.put("module", module);
@@ -455,7 +337,7 @@ final class StructuredLogger {
 }
 ```
 
-- [ ] **Step 6: Write `ExecutionLog`**
+- [ ] **Step 6: `ExecutionLog`**
 
 ```java
 package com.intelbras.iotevents.common.logging;
@@ -507,51 +389,23 @@ public final class ExecutionLog {
 }
 ```
 
-- [ ] **Step 7: Run the test to verify it passes**
-
-Run: `mvn -q test -Dtest=ExecutionLogTest`
-Expected: `Tests run: 2, Failures: 0, Errors: 0`
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/common/logging src/test/java/com/intelbras/iotevents/common/logging
-git commit -m "feat: add ExecutionLog structured one-log-per-behaviour logging"
-```
-
-- [ ] **Step 9: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/execution-log
-git branch -d feat/execution-log
-```
+- [ ] **Step 7: Run, verify passes** — `mvn -q test -Dtest=ExecutionLogTest` → 2 passed
+- [ ] **Step 8: Commit** — `git add src/main/java/com/intelbras/iotevents/common/logging src/test/java/com/intelbras/iotevents/common/logging && git commit -m "feat: add ExecutionLog structured one-log-per-behaviour logging"`
+- [ ] **Step 9: Merge** — `git checkout main && git merge --no-ff feat/execution-log && git branch -d feat/execution-log`
 
 ---
 
-### Task 3: Device domain core models
+### Task 3: Device domain core models (`EventCategory`, real field mapping)
 
 **Files:**
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/core/DeviceType.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/core/DeviceEventRow.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/core/DeviceEvent.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/core/error/DeviceDomainError.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/core/error/DeviceEventValidationError.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/core/DedupKeyGenerator.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/device/core/DeviceEventTest.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/device/core/DedupKeyGeneratorTest.java`
+- Create: `domains/device/core/{EventCategory,DeviceEventRow,DeviceEvent,DedupKeyGenerator}.java`, `domains/device/core/error/{DeviceDomainError,DeviceEventValidationError}.java`
+- Test: `DeviceEventTest.java`, `DedupKeyGeneratorTest.java`
 
-**Interfaces:**
-- Produces: `DeviceEvent(String eventId, String deviceId, DeviceType deviceType, String eventType, Instant timestamp, Map<String,Object> payload)` with static factory `DeviceEvent.from(DeviceEventRow row)`; `DeviceEventRow(String id, String deviceId, String deviceTypeRaw, String eventTypeRaw, String timestampRaw, Map<String,Object> payload)`; `DeviceType.fromRaw(String)`; `DedupKeyGenerator.generate(String deviceId, String eventType, String timestampRaw, Map<String,Object> payload)`.
+**Interfaces:** `DeviceEvent(String eventId, String deviceId, EventCategory eventCategory, String eventType, Instant timestamp, Map<String,Object> payload)` with `DeviceEvent.from(DeviceEventRow)`; `DeviceEventRow(String id, String deviceId, String msgTypeRaw, String timestampRaw, Map<String,Object> payload)`; `EventCategory.fromMsgType(String): EventCategory`; `DedupKeyGenerator.generate(String deviceId, String eventType, String timestampRaw, Map<String,Object> payload): String`.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/device-core-models`
 
-```bash
-git checkout main
-git checkout -b feat/device-core-models
-```
-
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 2: Failing tests**
 
 ```java
 package com.intelbras.iotevents.domains.device.core;
@@ -559,6 +413,7 @@ package com.intelbras.iotevents.domains.device.core;
 import com.intelbras.iotevents.domains.device.core.error.DeviceEventValidationError;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -568,55 +423,57 @@ class DeviceEventTest {
 
     @Test
     void shouldBuildDeviceEventFromRowWithOwnId() {
-        DeviceEventRow row = new DeviceEventRow("evt-1", "cam-001", "camera", "motion_detected",
-            "2026-01-10T10:00:00Z", Map.of("confidence", 0.9));
+        DeviceEventRow row = new DeviceEventRow("evt-1", "DEVICE-00014", "iotProperty",
+            "2026-09-25T08:47:51.157000+00:00", Map.of("properties", Map.of("11800", 3)));
 
         DeviceEvent event = DeviceEvent.from(row);
 
         assertThat(event.eventId()).isEqualTo("evt-1");
-        assertThat(event.deviceId()).isEqualTo("cam-001");
-        assertThat(event.deviceType()).isEqualTo(DeviceType.CAMERA);
-        assertThat(event.eventType()).isEqualTo("MOTION_DETECTED");
+        assertThat(event.deviceId()).isEqualTo("DEVICE-00014");
+        assertThat(event.eventCategory()).isEqualTo(EventCategory.PROPERTY_CHANGE);
+        assertThat(event.eventType()).isEqualTo("iotProperty");
+        assertThat(event.timestamp()).isEqualTo(Instant.parse("2026-09-25T08:47:51.157000Z"));
     }
 
     @Test
     void shouldFallBackToHashEventIdWhenRowHasNoId() {
-        DeviceEventRow row = new DeviceEventRow(null, "cam-001", "camera", "motion_detected",
-            "2026-01-10T10:00:00Z", Map.of("confidence", 0.9));
+        DeviceEventRow row = new DeviceEventRow(null, "DEVICE-00066", "videoMotion",
+            "2026-09-25T09:30:11.000000+00:00", Map.of());
 
         DeviceEvent event = DeviceEvent.from(row);
 
-        assertThat(event.eventId()).isNotBlank();
         assertThat(event.eventId()).isEqualTo(
-            DedupKeyGenerator.generate("cam-001", "MOTION_DETECTED", "2026-01-10T10:00:00Z", Map.of("confidence", 0.9)));
+            DedupKeyGenerator.generate("DEVICE-00066", "videoMotion", "2026-09-25T09:30:11.000000+00:00", Map.of()));
     }
 
     @Test
-    void shouldFallBackToGenericDeviceTypeWhenUnrecognized() {
-        DeviceEventRow row = new DeviceEventRow("evt-2", "lock-001", "lock", "status_change",
-            "2026-01-10T10:00:00Z", Map.of());
+    void shouldClassifyMotionDetectionEventsCorrectly() {
+        DeviceEventRow row = new DeviceEventRow("evt-2", "DEVICE-00077", "mobileDetect",
+            "2026-09-25T09:31:00.000000+00:00", Map.of());
 
-        DeviceEvent event = DeviceEvent.from(row);
+        assertThat(DeviceEvent.from(row).eventCategory()).isEqualTo(EventCategory.MOTION_DETECTION);
+    }
 
-        assertThat(event.deviceType()).isEqualTo(DeviceType.GENERIC);
+    @Test
+    void shouldFallBackToOtherCategoryForUnrecognizedMsgType() {
+        DeviceEventRow row = new DeviceEventRow("evt-3", "DEVICE-00099", "someFutureMsgType",
+            "2026-09-25T09:32:00.000000+00:00", Map.of());
+
+        assertThat(DeviceEvent.from(row).eventCategory()).isEqualTo(EventCategory.OTHER);
     }
 
     @Test
     void shouldRejectRowWithoutDeviceId() {
-        DeviceEventRow row = new DeviceEventRow("evt-3", "", "camera", "motion_detected",
-            "2026-01-10T10:00:00Z", Map.of());
+        DeviceEventRow row = new DeviceEventRow("evt-4", "", "iotProperty", "2026-09-25T08:47:51.157000+00:00", Map.of());
 
-        assertThatThrownBy(() -> DeviceEvent.from(row))
-            .isInstanceOf(DeviceEventValidationError.class);
+        assertThatThrownBy(() -> DeviceEvent.from(row)).isInstanceOf(DeviceEventValidationError.class);
     }
 
     @Test
     void shouldRejectRowWithInvalidTimestamp() {
-        DeviceEventRow row = new DeviceEventRow("evt-4", "cam-001", "camera", "motion_detected",
-            "not-a-timestamp", Map.of());
+        DeviceEventRow row = new DeviceEventRow("evt-5", "DEVICE-00014", "iotProperty", "not-a-timestamp", Map.of());
 
-        assertThatThrownBy(() -> DeviceEvent.from(row))
-            .isInstanceOf(DeviceEventValidationError.class);
+        assertThatThrownBy(() -> DeviceEvent.from(row)).isInstanceOf(DeviceEventValidationError.class);
     }
 }
 ```
@@ -634,28 +491,25 @@ class DedupKeyGeneratorTest {
 
     @Test
     void shouldBeDeterministicForTheSameInputs() {
-        String first = DedupKeyGenerator.generate("cam-001", "MOTION_DETECTED", "2026-01-10T10:00:00Z", Map.of("confidence", 0.9));
-        String second = DedupKeyGenerator.generate("cam-001", "MOTION_DETECTED", "2026-01-10T10:00:00Z", Map.of("confidence", 0.9));
+        String first = DedupKeyGenerator.generate("DEVICE-00014", "iotProperty", "2026-09-25T08:47:51.157000+00:00", Map.of("x", 1));
+        String second = DedupKeyGenerator.generate("DEVICE-00014", "iotProperty", "2026-09-25T08:47:51.157000+00:00", Map.of("x", 1));
 
         assertThat(first).isEqualTo(second);
     }
 
     @Test
     void shouldDifferWhenAnyInputDiffers() {
-        String first = DedupKeyGenerator.generate("cam-001", "MOTION_DETECTED", "2026-01-10T10:00:00Z", Map.of("confidence", 0.9));
-        String second = DedupKeyGenerator.generate("cam-002", "MOTION_DETECTED", "2026-01-10T10:00:00Z", Map.of("confidence", 0.9));
+        String first = DedupKeyGenerator.generate("DEVICE-00014", "iotProperty", "2026-09-25T08:47:51.157000+00:00", Map.of());
+        String second = DedupKeyGenerator.generate("DEVICE-00015", "iotProperty", "2026-09-25T08:47:51.157000+00:00", Map.of());
 
         assertThat(first).isNotEqualTo(second);
     }
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [ ] **Step 3: Run, verify fails** — `mvn -q test -Dtest=DeviceEventTest,DedupKeyGeneratorTest`
 
-Run: `mvn -q test -Dtest=DeviceEventTest,DedupKeyGeneratorTest`
-Expected: FAIL — classes under test do not exist yet.
-
-- [ ] **Step 4: Write `DeviceDomainError` and `DeviceEventValidationError`**
+- [ ] **Step 4: Error classes**
 
 ```java
 package com.intelbras.iotevents.domains.device.core.error;
@@ -677,28 +531,40 @@ public class DeviceEventValidationError extends DeviceDomainError {
 }
 ```
 
-- [ ] **Step 5: Write `DeviceType`**
+- [ ] **Step 5: `EventCategory`**
 
 ```java
 package com.intelbras.iotevents.domains.device.core;
 
-public enum DeviceType {
-    CAMERA, SENSOR, ALARM, GENERIC;
+import java.util.Set;
 
-    public static DeviceType fromRaw(String raw) {
-        if (raw == null || raw.isBlank()) {
-            return GENERIC;
+public enum EventCategory {
+    PROPERTY_CHANGE, STATUS_CHANGE, MOTION_DETECTION, OTHER;
+
+    private static final Set<String> PROPERTY_CHANGE_TYPES = Set.of("iotProperty");
+    private static final Set<String> STATUS_CHANGE_TYPES = Set.of("online", "offline");
+    private static final Set<String> MOTION_DETECTION_TYPES = Set.of("videoMotion", "mobileDetect", "human", "smartVideoMotion");
+
+    public static EventCategory fromMsgType(String msgType) {
+        if (msgType == null) {
+            return OTHER;
         }
-        try {
-            return DeviceType.valueOf(raw.trim().toUpperCase());
-        } catch (IllegalArgumentException unrecognized) {
-            return GENERIC;
+        String trimmed = msgType.trim();
+        if (PROPERTY_CHANGE_TYPES.contains(trimmed)) {
+            return PROPERTY_CHANGE;
         }
+        if (STATUS_CHANGE_TYPES.contains(trimmed)) {
+            return STATUS_CHANGE;
+        }
+        if (MOTION_DETECTION_TYPES.contains(trimmed)) {
+            return MOTION_DETECTION;
+        }
+        return OTHER;
     }
 }
 ```
 
-- [ ] **Step 6: Write `DedupKeyGenerator`**
+- [ ] **Step 6: `DedupKeyGenerator`**
 
 ```java
 package com.intelbras.iotevents.domains.device.core;
@@ -732,19 +598,19 @@ public final class DedupKeyGenerator {
 }
 ```
 
-- [ ] **Step 7: Write `DeviceEventRow`**
+- [ ] **Step 7: `DeviceEventRow`**
 
 ```java
 package com.intelbras.iotevents.domains.device.core;
 
 import java.util.Map;
 
-public record DeviceEventRow(String id, String deviceId, String deviceTypeRaw, String eventTypeRaw,
-                              String timestampRaw, Map<String, Object> payload) {
+public record DeviceEventRow(String id, String deviceId, String msgTypeRaw, String timestampRaw,
+                              Map<String, Object> payload) {
 }
 ```
 
-- [ ] **Step 8: Write `DeviceEvent`**
+- [ ] **Step 8: `DeviceEvent`**
 
 ```java
 package com.intelbras.iotevents.domains.device.core;
@@ -752,10 +618,11 @@ package com.intelbras.iotevents.domains.device.core;
 import com.intelbras.iotevents.domains.device.core.error.DeviceEventValidationError;
 
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.Map;
 
-public record DeviceEvent(String eventId, String deviceId, DeviceType deviceType, String eventType,
+public record DeviceEvent(String eventId, String deviceId, EventCategory eventCategory, String eventType,
                            Instant timestamp, Map<String, Object> payload) {
 
     public static DeviceEvent from(DeviceEventRow row) {
@@ -768,75 +635,48 @@ public record DeviceEvent(String eventId, String deviceId, DeviceType deviceType
 
         Instant timestamp;
         try {
-            timestamp = Instant.parse(row.timestampRaw());
+            timestamp = OffsetDateTime.parse(row.timestampRaw()).toInstant();
         } catch (DateTimeParseException invalidTimestamp) {
             throw new DeviceEventValidationError(
                 "invalid timestamp '" + row.timestampRaw() + "' for deviceId=" + row.deviceId());
         }
 
-        DeviceType deviceType = DeviceType.fromRaw(row.deviceTypeRaw());
-        String eventType = (row.eventTypeRaw() == null || row.eventTypeRaw().isBlank())
-            ? "UNKNOWN"
-            : row.eventTypeRaw().trim().toUpperCase();
+        String eventType = (row.msgTypeRaw() == null || row.msgTypeRaw().isBlank())
+            ? "unknown"
+            : row.msgTypeRaw().trim();
+        EventCategory eventCategory = EventCategory.fromMsgType(eventType);
         Map<String, Object> payload = row.payload() == null ? Map.of() : row.payload();
 
         String eventId = (row.id() != null && !row.id().isBlank())
             ? row.id()
             : DedupKeyGenerator.generate(row.deviceId(), eventType, row.timestampRaw(), payload);
 
-        return new DeviceEvent(eventId, row.deviceId(), deviceType, eventType, timestamp, payload);
+        return new DeviceEvent(eventId, row.deviceId(), eventCategory, eventType, timestamp, payload);
     }
 }
 ```
 
-- [ ] **Step 9: Run the tests to verify they pass**
-
-Run: `mvn -q test -Dtest=DeviceEventTest,DedupKeyGeneratorTest`
-Expected: `Tests run: 7, Failures: 0, Errors: 0`
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/domains/device/core src/test/java/com/intelbras/iotevents/domains/device/core
-git commit -m "feat: add device domain core models and validation"
-```
-
-- [ ] **Step 11: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/device-core-models
-git branch -d feat/device-core-models
-```
+- [ ] **Step 9: Run, verify passes** — `mvn -q test -Dtest=DeviceEventTest,DedupKeyGeneratorTest` → 8 passed
+- [ ] **Step 10: Commit** — `git add src/main/java/com/intelbras/iotevents/domains/device/core src/test/java/com/intelbras/iotevents/domains/device/core && git commit -m "feat: add device domain core models with real-data field mapping"`
+- [ ] **Step 11: Merge** — `git checkout main && git merge --no-ff feat/device-core-models && git branch -d feat/device-core-models`
 
 ---
 
 ### Task 4: Device domain ports and `SimulateIngestionUseCase`
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/core/port/EventSourcePort.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/core/port/EventPublisherPort.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/core/usecase/SimulateIngestionUseCase.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/device/core/usecase/SimulateIngestionUseCaseTest.java`
+**Files:** Create `domains/device/core/port/{EventSourcePort,EventPublisherPort}.java`, `domains/device/core/usecase/SimulateIngestionUseCase.java`; Test `SimulateIngestionUseCaseTest.java`.
 
-**Interfaces:**
-- Consumes: `DeviceEvent` from Task 3.
-- Produces: `EventSourcePort.readAll(): List<DeviceEvent>`; `EventPublisherPort.publish(DeviceEvent event): void`; `SimulateIngestionUseCase(EventSourcePort, EventPublisherPort)` with `execute(): int` (count published). Task 7 (REST controller) and Task 5/7 (adapters) depend on these exact signatures.
+**Interfaces:** `EventSourcePort.readAll(): List<DeviceEvent>`; `EventPublisherPort.publish(DeviceEvent)`; `SimulateIngestionUseCase(EventSourcePort, EventPublisherPort).execute(): int`.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/simulate-ingestion-usecase`
 
-```bash
-git checkout main
-git checkout -b feat/simulate-ingestion-usecase
-```
-
-- [ ] **Step 2: Write the failing test using in-test fake adapters**
+- [ ] **Step 2: Failing test**
 
 ```java
 package com.intelbras.iotevents.domains.device.core.usecase;
 
 import com.intelbras.iotevents.domains.device.core.DeviceEvent;
-import com.intelbras.iotevents.domains.device.core.DeviceType;
+import com.intelbras.iotevents.domains.device.core.EventCategory;
 import com.intelbras.iotevents.domains.device.core.port.EventPublisherPort;
 import com.intelbras.iotevents.domains.device.core.port.EventSourcePort;
 import org.junit.jupiter.api.Test;
@@ -852,10 +692,10 @@ class SimulateIngestionUseCaseTest {
 
     @Test
     void shouldPublishEveryEventReadFromTheSource() {
-        DeviceEvent eventOne = new DeviceEvent("evt-1", "cam-001", DeviceType.CAMERA, "MOTION_DETECTED",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of());
-        DeviceEvent eventTwo = new DeviceEvent("evt-2", "sensor-001", DeviceType.SENSOR, "STATUS_CHANGE",
-            Instant.parse("2026-01-10T10:01:00Z"), Map.of());
+        DeviceEvent eventOne = new DeviceEvent("evt-1", "DEVICE-00014", EventCategory.PROPERTY_CHANGE, "iotProperty",
+            Instant.parse("2026-09-25T08:47:51.157000Z"), Map.of());
+        DeviceEvent eventTwo = new DeviceEvent("evt-2", "DEVICE-00066", EventCategory.MOTION_DETECTION, "videoMotion",
+            Instant.parse("2026-09-25T09:30:11.000000Z"), Map.of());
 
         EventSourcePort source = () -> List.of(eventOne, eventTwo);
         List<DeviceEvent> published = new ArrayList<>();
@@ -863,9 +703,7 @@ class SimulateIngestionUseCaseTest {
 
         SimulateIngestionUseCase useCase = new SimulateIngestionUseCase(source, publisher);
 
-        int publishedCount = useCase.execute();
-
-        assertThat(publishedCount).isEqualTo(2);
+        assertThat(useCase.execute()).isEqualTo(2);
         assertThat(published).containsExactly(eventOne, eventTwo);
     }
 
@@ -874,19 +712,14 @@ class SimulateIngestionUseCaseTest {
         EventSourcePort source = List::of;
         EventPublisherPort publisher = event -> { throw new AssertionError("should not publish anything"); };
 
-        SimulateIngestionUseCase useCase = new SimulateIngestionUseCase(source, publisher);
-
-        assertThat(useCase.execute()).isZero();
+        assertThat(new SimulateIngestionUseCase(source, publisher).execute()).isZero();
     }
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [ ] **Step 3: Run, verify fails** — `mvn -q test -Dtest=SimulateIngestionUseCaseTest`
 
-Run: `mvn -q test -Dtest=SimulateIngestionUseCaseTest`
-Expected: FAIL — `EventSourcePort`, `EventPublisherPort`, `SimulateIngestionUseCase` do not exist yet.
-
-- [ ] **Step 4: Write the ports**
+- [ ] **Step 4: Ports**
 
 ```java
 package com.intelbras.iotevents.domains.device.core.port;
@@ -910,7 +743,7 @@ public interface EventPublisherPort {
 }
 ```
 
-- [ ] **Step 5: Write `SimulateIngestionUseCase`**
+- [ ] **Step 5: `SimulateIngestionUseCase`**
 
 ```java
 package com.intelbras.iotevents.domains.device.core.usecase;
@@ -955,77 +788,50 @@ public class SimulateIngestionUseCase {
 }
 ```
 
-- [ ] **Step 6: Run the test to verify it passes**
-
-Run: `mvn -q test -Dtest=SimulateIngestionUseCaseTest`
-Expected: `Tests run: 2, Failures: 0, Errors: 0`
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/domains/device/core/port src/main/java/com/intelbras/iotevents/domains/device/core/usecase src/test/java/com/intelbras/iotevents/domains/device/core/usecase
-git commit -m "feat: add device domain ports and SimulateIngestionUseCase"
-```
-
-- [ ] **Step 8: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/simulate-ingestion-usecase
-git branch -d feat/simulate-ingestion-usecase
-```
+- [ ] **Step 6: Run, verify passes** — `mvn -q test -Dtest=SimulateIngestionUseCaseTest` → 2 passed
+- [ ] **Step 7: Commit** — `git add src/main/java/com/intelbras/iotevents/domains/device/core/port src/main/java/com/intelbras/iotevents/domains/device/core/usecase src/test/java/com/intelbras/iotevents/domains/device/core/usecase && git commit -m "feat: add device domain ports and SimulateIngestionUseCase"`
+- [ ] **Step 8: Merge** — `git checkout main && git merge --no-ff feat/simulate-ingestion-usecase && git branch -d feat/simulate-ingestion-usecase`
 
 ---
 
-### Task 5: CSV event source adapter + sample dataset
+### Task 5: CSV event source adapter + real dataset
 
 **Files:**
-- Create: `src/main/resources/events.csv`
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/adapters/csv/CsvEventSourceAdapter.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/device/adapters/csv/CsvEventSourceAdapterTest.java`
+- Create: `src/main/resources/events.csv` (real 100 rows + 4 synthetic)
+- Create: `domains/device/adapters/csv/CsvEventSourceAdapter.java`
+- Test: `CsvEventSourceAdapterTest.java`
 
-**Interfaces:**
-- Consumes: `EventSourcePort` (Task 4), `DeviceEvent`/`DeviceEventRow` (Task 3).
-- Produces: a Spring `@Component` implementing `EventSourcePort`, reading `events.csv` from the classpath.
+**Interfaces:** `CsvEventSourceAdapter(ObjectMapper) implements EventSourcePort`.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/csv-event-source-adapter`
+
+- [ ] **Step 2: Build the dataset file** — copy the real CSV, then append 4 synthetic DLQ-demo rows:
 
 ```bash
-git checkout main
-git checkout -b feat/csv-event-source-adapter
+cp "case_information/case_backend_senior_eventos_sanitizados 1.csv" src/main/resources/events.csv
+cat >> src/main/resources/events.csv <<'EOF'
+101,2026-09-25T10:00:00.000000+00:00,iotProperty,SYNTHETIC-DLQ-001,Synthetic DLQ Demo 1,PRODUCT-DEMO,,,20260925T100000,USER-DEMO,PROJECT-CASE,"{""simulateFailure"":true}","{""content"":{""simulateFailure"":true},""did"":""SYNTHETIC-DLQ-001"",""dname"":""Synthetic DLQ Demo 1"",""msgType"":""iotProperty"",""pid"":""PRODUCT-DEMO"",""utcTime"":""20260925T100000"",""appId"":""APP-CASE"",""userId"":""USER-DEMO"",""oauthProject"":""PROJECT-CASE""}"
+102,2026-09-25T10:01:00.000000+00:00,online,SYNTHETIC-DLQ-002,Synthetic DLQ Demo 2,PRODUCT-DEMO,,,20260925T100100,USER-DEMO,PROJECT-CASE,"{""simulateFailure"":true}","{""content"":{""simulateFailure"":true},""did"":""SYNTHETIC-DLQ-002"",""dname"":""Synthetic DLQ Demo 2"",""msgType"":""online"",""pid"":""PRODUCT-DEMO"",""utcTime"":""20260925T100100"",""appId"":""APP-CASE"",""userId"":""USER-DEMO"",""oauthProject"":""PROJECT-CASE""}"
+103,2026-09-25T10:02:00.000000+00:00,videoMotion,SYNTHETIC-DLQ-003,Synthetic DLQ Demo 3,,,,20260925T100200,USER-DEMO,PROJECT-CASE,"{""simulateFailure"":true}","{""accessType"":""PaaS"",""action"":""start"",""deviceType"":""IPC"",""did"":""SYNTHETIC-DLQ-003"",""dname"":""Synthetic DLQ Demo 3"",""labelType"":""motionAlarm"",""msgType"":""videoMotion"",""content"":{""simulateFailure"":true},""utcTime"":1790340000,""appId"":""APP-CASE"",""userId"":""USER-DEMO"",""oauthProject"":""PROJECT-CASE""}"
+104,2026-09-25T10:03:00.000000+00:00,upgradeFail,SYNTHETIC-DLQ-004,Synthetic DLQ Demo 4,,,,20260925T100300,USER-DEMO,PROJECT-CASE,"{""simulateFailure"":true}","{""accessType"":""PaaS"",""deviceType"":""IPC"",""did"":""SYNTHETIC-DLQ-004"",""dname"":""Synthetic DLQ Demo 4"",""msgType"":""upgradeFail"",""content"":{""simulateFailure"":true},""utcTime"":1790340300,""appId"":""APP-CASE"",""userId"":""USER-DEMO"",""oauthProject"":""PROJECT-CASE""}"
+EOF
 ```
 
-- [ ] **Step 2: Write the sample dataset `src/main/resources/events.csv`**
+These 4 rows are clearly labeled (`SYNTHETIC-DLQ-00N` ids), one per `EventCategory`, each carrying `simulateFailure: true` — see `DECISIONS.md` (Task 18) for why they exist.
 
-This stands in for the real 100-event CSV until it arrives (per the design spec). It covers all four device types, one unrecognized device type (`lock`, falls back to `GENERIC`), and one row carrying `simulateFailure: true` to exercise the retry/DLQ path end-to-end later.
-
-```csv
-id,device_id,device_type,event_type,timestamp,payload_json
-evt-001,cam-001,camera,motion_detected,2026-01-10T10:00:00Z,"{""confidence"":0.92}"
-evt-002,cam-002,camera,property_change,2026-01-10T10:01:00Z,"{""resolution"":""1080p""}"
-evt-003,sensor-001,sensor,motion_detected,2026-01-10T10:02:00Z,"{""zone"":""living_room""}"
-evt-004,sensor-002,sensor,status_change,2026-01-10T10:03:00Z,"{""battery"":""low""}"
-evt-005,alarm-001,alarm,status_change,2026-01-10T10:04:00Z,"{""status"":""ARMED""}"
-evt-006,alarm-002,alarm,status_change,2026-01-10T10:05:00Z,"{""status"":""TRIGGERED""}"
-evt-007,lock-001,lock,status_change,2026-01-10T10:06:00Z,"{""status"":""LOCKED""}"
-evt-008,cam-001,camera,motion_detected,2026-01-10T10:07:00Z,"{""confidence"":0.75}"
-evt-009,sensor-001,sensor,motion_detected,2026-01-10T10:08:00Z,"{""zone"":""kitchen""}"
-evt-010,alarm-001,alarm,status_change,2026-01-10T10:09:00Z,"{""simulateFailure"":true}"
-evt-011,cam-003,camera,motion_detected,2026-01-10T10:10:00Z,"{""confidence"":0.60}"
-evt-012,sensor-003,sensor,status_change,2026-01-10T10:11:00Z,"{""battery"":""full""}"
-```
-
-- [ ] **Step 3: Write the failing test**
+- [ ] **Step 3: Failing test**
 
 ```java
 package com.intelbras.iotevents.domains.device.adapters.csv;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.intelbras.iotevents.domains.device.core.DeviceEvent;
-import com.intelbras.iotevents.domains.device.core.DeviceType;
+import com.intelbras.iotevents.domains.device.core.EventCategory;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -1034,49 +840,58 @@ class CsvEventSourceAdapterTest {
     private final CsvEventSourceAdapter adapter = new CsvEventSourceAdapter(new ObjectMapper());
 
     @Test
-    void shouldReadAllValidRowsFromTheSampleCsv() {
-        List<DeviceEvent> events = adapter.readAll();
-
-        assertThat(events).hasSize(12);
-        assertThat(events).anySatisfy(event -> {
-            assertThat(event.eventId()).isEqualTo("evt-001");
-            assertThat(event.deviceType()).isEqualTo(DeviceType.CAMERA);
-            assertThat(event.payload()).containsEntry("confidence", 0.92);
-        });
+    void shouldReadAllRealAndSyntheticRowsFromTheDataset() {
+        assertThat(adapter.readAll()).hasSize(104);
     }
 
     @Test
-    void shouldFallBackToGenericDeviceTypeForUnrecognizedDeviceType() {
-        List<DeviceEvent> events = adapter.readAll();
+    void shouldClassifyARealIotPropertyRowAsPropertyChange() {
+        DeviceEvent event = adapter.readAll().stream()
+            .filter(e -> e.deviceId().equals("DEVICE-00014"))
+            .findFirst().orElseThrow();
 
-        DeviceEvent lockEvent = events.stream()
-            .filter(event -> event.eventId().equals("evt-007"))
-            .findFirst()
-            .orElseThrow();
-
-        assertThat(lockEvent.deviceType()).isEqualTo(DeviceType.GENERIC);
+        assertThat(event.eventCategory()).isEqualTo(EventCategory.PROPERTY_CHANGE);
+        assertThat(event.eventType()).isEqualTo("iotProperty");
+        assertThat(event.payload()).containsKey("properties");
     }
 
     @Test
-    void shouldCarryForcedFailureFlagThroughUnchanged() {
-        List<DeviceEvent> events = adapter.readAll();
+    void shouldClassifyARealVideoMotionRowAsMotionDetection() {
+        DeviceEvent event = adapter.readAll().stream()
+            .filter(e -> e.deviceId().equals("DEVICE-00066"))
+            .findFirst().orElseThrow();
 
-        DeviceEvent failingEvent = events.stream()
-            .filter(event -> event.eventId().equals("evt-010"))
-            .findFirst()
-            .orElseThrow();
+        assertThat(event.eventCategory()).isEqualTo(EventCategory.MOTION_DETECTION);
+    }
 
-        assertThat(failingEvent.payload()).containsEntry("simulateFailure", true);
+    @Test
+    void shouldFallBackToBodyCompletoDeviceIdForBlankDidRows() {
+        Set<String> informationTransferDeviceIds = adapter.readAll().stream()
+            .filter(e -> e.eventType().equals("informationTransfer"))
+            .map(DeviceEvent::deviceId)
+            .collect(Collectors.toSet());
+
+        assertThat(informationTransferDeviceIds).containsExactlyInAnyOrder("FJ1K2001704PS", "IA8L4001890ZN");
+    }
+
+    @Test
+    void shouldCarrySimulateFailureFlagOnTheFourSyntheticDemoRowsAcrossAllCategories() {
+        List<DeviceEvent> synthetic = adapter.readAll().stream()
+            .filter(e -> e.deviceId().startsWith("SYNTHETIC-DLQ-"))
+            .toList();
+
+        assertThat(synthetic).hasSize(4);
+        assertThat(synthetic).allSatisfy(e -> assertThat(e.payload()).containsEntry("simulateFailure", true));
+        assertThat(synthetic.stream().map(DeviceEvent::eventCategory).collect(Collectors.toSet()))
+            .containsExactlyInAnyOrder(EventCategory.PROPERTY_CHANGE, EventCategory.STATUS_CHANGE,
+                EventCategory.MOTION_DETECTION, EventCategory.OTHER);
     }
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it fails**
+- [ ] **Step 4: Run, verify fails** — `mvn -q test -Dtest=CsvEventSourceAdapterTest`
 
-Run: `mvn -q test -Dtest=CsvEventSourceAdapterTest`
-Expected: FAIL — `CsvEventSourceAdapter` does not exist yet.
-
-- [ ] **Step 5: Write `CsvEventSourceAdapter`**
+- [ ] **Step 5: `CsvEventSourceAdapter`**
 
 ```java
 package com.intelbras.iotevents.domains.device.adapters.csv;
@@ -1112,8 +927,7 @@ public class CsvEventSourceAdapter implements EventSourcePort {
 
     @Override
     public List<DeviceEvent> readAll() {
-        ExecutionLog log = ExecutionLog.start(CsvEventSourceAdapter.class, "readAll")
-            .context("resource", CSV_RESOURCE);
+        ExecutionLog log = ExecutionLog.start(CsvEventSourceAdapter.class, "readAll").context("resource", CSV_RESOURCE);
         List<DeviceEvent> events = new ArrayList<>();
         int skipped = 0;
 
@@ -1130,8 +944,7 @@ public class CsvEventSourceAdapter implements EventSourcePort {
                 } catch (Exception rowError) {
                     skipped++;
                     log.step("Skipped malformed CSV row", Map.of(
-                        "rowNumber", record.getRecordNumber(),
-                        "reason", String.valueOf(rowError.getMessage())));
+                        "rowNumber", record.getRecordNumber(), "reason", String.valueOf(rowError.getMessage())));
                 }
             }
 
@@ -1146,21 +959,37 @@ public class CsvEventSourceAdapter implements EventSourcePort {
     }
 
     private DeviceEventRow toRow(CSVRecord record) {
-        return new DeviceEventRow(
-            blankToNull(getOrNull(record, "id")),
-            record.get("device_id"),
-            record.get("device_type"),
-            record.get("event_type"),
-            record.get("timestamp"),
-            parsePayload(getOrNull(record, "payload_json")));
+        Map<String, Object> bodyCompleto = parseJsonObject(getOrNull(record, "body_completo"));
+        String deviceId = resolveDeviceId(getOrNull(record, "did"), bodyCompleto);
+        String nativeId = resolveNativeId(bodyCompleto);
+        Map<String, Object> payload = parseJsonObject(getOrNull(record, "content"));
+
+        return new DeviceEventRow(nativeId, deviceId, record.get("msgType"), record.get("timestamp_log"), payload);
     }
 
-    private Map<String, Object> parsePayload(String payloadJson) {
-        if (payloadJson == null || payloadJson.isBlank()) {
+    private String resolveDeviceId(String did, Map<String, Object> bodyCompleto) {
+        if (did != null && !did.isBlank()) {
+            return did;
+        }
+        Object fallback = bodyCompleto.get("deviceId");
+        return fallback != null ? String.valueOf(fallback) : "UNKNOWN";
+    }
+
+    private String resolveNativeId(Map<String, Object> bodyCompleto) {
+        Object id = bodyCompleto.get("id");
+        if (id != null) {
+            return String.valueOf(id);
+        }
+        Object alarmId = bodyCompleto.get("alarmId");
+        return alarmId != null ? String.valueOf(alarmId) : null;
+    }
+
+    private Map<String, Object> parseJsonObject(String json) {
+        if (json == null || json.isBlank()) {
             return Map.of();
         }
         try {
-            return objectMapper.readValue(payloadJson, new TypeReference<Map<String, Object>>() {
+            return objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {
             });
         } catch (Exception invalidJson) {
             return Map.of();
@@ -1168,56 +997,26 @@ public class CsvEventSourceAdapter implements EventSourcePort {
     }
 
     private String getOrNull(CSVRecord record, String column) {
-        return record.isMapped(column) ? record.get(column) : null;
-    }
-
-    private String blankToNull(String value) {
-        return (value == null || value.isBlank()) ? null : value;
+        return record.isMapped(column) && !record.get(column).isBlank() ? record.get(column) : null;
     }
 }
 ```
 
-- [ ] **Step 6: Run the test to verify it passes**
-
-Run: `mvn -q test -Dtest=CsvEventSourceAdapterTest`
-Expected: `Tests run: 3, Failures: 0, Errors: 0`
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/main/resources/events.csv src/main/java/com/intelbras/iotevents/domains/device/adapters/csv src/test/java/com/intelbras/iotevents/domains/device/adapters/csv
-git commit -m "feat: add CSV event source adapter and sample dataset"
-```
-
-- [ ] **Step 8: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/csv-event-source-adapter
-git branch -d feat/csv-event-source-adapter
-```
+- [ ] **Step 6: Run, verify passes** — `mvn -q test -Dtest=CsvEventSourceAdapterTest` → 4 passed
+- [ ] **Step 7: Commit** — `git add src/main/resources/events.csv src/main/java/com/intelbras/iotevents/domains/device/adapters/csv src/test/java/com/intelbras/iotevents/domains/device/adapters/csv && git commit -m "feat: add CSV event source adapter over the real dataset"`
+- [ ] **Step 8: Merge** — `git checkout main && git merge --no-ff feat/csv-event-source-adapter && git branch -d feat/csv-event-source-adapter`
 
 ---
 
 ### Task 6: Kafka topics configuration
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/config/KafkaTopics.java`
-- Create: `src/main/java/com/intelbras/iotevents/config/KafkaTopicConfig.java`
+**Files:** Create `config/KafkaTopics.java`, `config/KafkaTopicConfig.java`.
 
-**Interfaces:**
-- Produces: string constants `KafkaTopics.DEVICE_CAMERA_EVENTS`, `DEVICE_SENSOR_EVENTS`, `DEVICE_ALARM_EVENTS`, `DEVICE_GENERIC_EVENTS`, `DLT_SUFFIX`, `PARTITIONS`, `DLT_PARTITIONS`, `CONSUMER_GROUP`, and `KafkaTopics.allTopics(): List<String>`. Task 7 (publisher), Task 12 (DLQ config), and Task 13 (listeners) all reference these constants directly (listener `@KafkaListener(topics = ...)` annotations require compile-time constants, which `public static final String` satisfies).
+**Interfaces:** `KafkaTopics.DEVICE_PROPERTY_CHANGE_EVENTS`, `DEVICE_STATUS_CHANGE_EVENTS`, `DEVICE_MOTION_DETECTION_EVENTS`, `DEVICE_OTHER_EVENTS`, `DLT_SUFFIX`, `PARTITIONS`, `DLT_PARTITIONS`, `CONSUMER_GROUP`, `allTopics(): List<String>`.
 
-This task has no independent runtime behaviour to unit test — it's Spring `@Bean` wiring, validated when the broker is up (Task 14's integration test confirms the topics actually get created). No test step; "deliverable" is a successful compile and a quick manual check against a running Kafka.
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b chore/kafka-topics-config`
 
-- [ ] **Step 1: Create the task branch**
-
-```bash
-git checkout main
-git checkout -b chore/kafka-topics-config
-```
-
-- [ ] **Step 2: Write `KafkaTopics`**
+- [ ] **Step 2: `KafkaTopics`**
 
 ```java
 package com.intelbras.iotevents.config;
@@ -1226,10 +1025,10 @@ import java.util.List;
 
 public final class KafkaTopics {
 
-    public static final String DEVICE_CAMERA_EVENTS = "device.camera.events";
-    public static final String DEVICE_SENSOR_EVENTS = "device.sensor.events";
-    public static final String DEVICE_ALARM_EVENTS = "device.alarm.events";
-    public static final String DEVICE_GENERIC_EVENTS = "device.generic.events";
+    public static final String DEVICE_PROPERTY_CHANGE_EVENTS = "device.property-change.events";
+    public static final String DEVICE_STATUS_CHANGE_EVENTS = "device.status-change.events";
+    public static final String DEVICE_MOTION_DETECTION_EVENTS = "device.motion-detection.events";
+    public static final String DEVICE_OTHER_EVENTS = "device.other.events";
     public static final String DLT_SUFFIX = ".DLT";
     public static final int PARTITIONS = 3;
     public static final int DLT_PARTITIONS = 1;
@@ -1239,12 +1038,13 @@ public final class KafkaTopics {
     }
 
     public static List<String> allTopics() {
-        return List.of(DEVICE_CAMERA_EVENTS, DEVICE_SENSOR_EVENTS, DEVICE_ALARM_EVENTS, DEVICE_GENERIC_EVENTS);
+        return List.of(DEVICE_PROPERTY_CHANGE_EVENTS, DEVICE_STATUS_CHANGE_EVENTS,
+            DEVICE_MOTION_DETECTION_EVENTS, DEVICE_OTHER_EVENTS);
     }
 }
 ```
 
-- [ ] **Step 3: Write `KafkaTopicConfig`**
+- [ ] **Step 3: `KafkaTopicConfig`**
 
 ```java
 package com.intelbras.iotevents.config;
@@ -1258,43 +1058,43 @@ import org.springframework.kafka.config.TopicBuilder;
 public class KafkaTopicConfig {
 
     @Bean
-    public NewTopic deviceCameraEventsTopic() {
-        return topic(KafkaTopics.DEVICE_CAMERA_EVENTS);
+    public NewTopic devicePropertyChangeEventsTopic() {
+        return topic(KafkaTopics.DEVICE_PROPERTY_CHANGE_EVENTS);
     }
 
     @Bean
-    public NewTopic deviceSensorEventsTopic() {
-        return topic(KafkaTopics.DEVICE_SENSOR_EVENTS);
+    public NewTopic deviceStatusChangeEventsTopic() {
+        return topic(KafkaTopics.DEVICE_STATUS_CHANGE_EVENTS);
     }
 
     @Bean
-    public NewTopic deviceAlarmEventsTopic() {
-        return topic(KafkaTopics.DEVICE_ALARM_EVENTS);
+    public NewTopic deviceMotionDetectionEventsTopic() {
+        return topic(KafkaTopics.DEVICE_MOTION_DETECTION_EVENTS);
     }
 
     @Bean
-    public NewTopic deviceGenericEventsTopic() {
-        return topic(KafkaTopics.DEVICE_GENERIC_EVENTS);
+    public NewTopic deviceOtherEventsTopic() {
+        return topic(KafkaTopics.DEVICE_OTHER_EVENTS);
     }
 
     @Bean
-    public NewTopic deviceCameraEventsDlt() {
-        return dlt(KafkaTopics.DEVICE_CAMERA_EVENTS);
+    public NewTopic devicePropertyChangeEventsDlt() {
+        return dlt(KafkaTopics.DEVICE_PROPERTY_CHANGE_EVENTS);
     }
 
     @Bean
-    public NewTopic deviceSensorEventsDlt() {
-        return dlt(KafkaTopics.DEVICE_SENSOR_EVENTS);
+    public NewTopic deviceStatusChangeEventsDlt() {
+        return dlt(KafkaTopics.DEVICE_STATUS_CHANGE_EVENTS);
     }
 
     @Bean
-    public NewTopic deviceAlarmEventsDlt() {
-        return dlt(KafkaTopics.DEVICE_ALARM_EVENTS);
+    public NewTopic deviceMotionDetectionEventsDlt() {
+        return dlt(KafkaTopics.DEVICE_MOTION_DETECTION_EVENTS);
     }
 
     @Bean
-    public NewTopic deviceGenericEventsDlt() {
-        return dlt(KafkaTopics.DEVICE_GENERIC_EVENTS);
+    public NewTopic deviceOtherEventsDlt() {
+        return dlt(KafkaTopics.DEVICE_OTHER_EVENTS);
     }
 
     private NewTopic topic(String name) {
@@ -1307,48 +1107,21 @@ public class KafkaTopicConfig {
 }
 ```
 
-- [ ] **Step 4: Verify the project compiles**
-
-Run: `mvn -q -DskipTests compile`
-Expected: `BUILD SUCCESS`
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/config/KafkaTopics.java src/main/java/com/intelbras/iotevents/config/KafkaTopicConfig.java
-git commit -m "chore: declare Kafka topics and DLT provisioning"
-```
-
-- [ ] **Step 6: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff chore/kafka-topics-config
-git branch -d chore/kafka-topics-config
-```
+- [ ] **Step 4: Verify compile** — `mvn -q -DskipTests compile`
+- [ ] **Step 5: Commit** — `git add src/main/java/com/intelbras/iotevents/config/KafkaTopics.java src/main/java/com/intelbras/iotevents/config/KafkaTopicConfig.java && git commit -m "chore: declare Kafka topics and DLT provisioning"`
+- [ ] **Step 6: Merge** — `git checkout main && git merge --no-ff chore/kafka-topics-config && git branch -d chore/kafka-topics-config`
 
 ---
 
 ### Task 7: Kafka event publisher adapter + simulation REST endpoint
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/adapters/kafka/KafkaEventPublisherAdapter.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/device/adapters/web/EventSimulationController.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/device/adapters/kafka/KafkaEventPublisherAdapterTest.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/device/adapters/web/EventSimulationControllerTest.java`
+**Files:** Create `domains/device/adapters/kafka/KafkaEventPublisherAdapter.java`, `domains/device/adapters/web/EventSimulationController.java`, `domains/device/DeviceUseCaseConfig.java`; Test both adapter and controller.
 
-**Interfaces:**
-- Consumes: `EventPublisherPort` (Task 4), `DeviceEvent`/`DeviceType` (Task 3), `KafkaTopics` (Task 6), `SimulateIngestionUseCase` (Task 4).
-- Produces: `KafkaEventPublisherAdapter implements EventPublisherPort`; `POST /events/simulate` returning `{"publishedCount": <int>}`.
+**Interfaces:** `KafkaEventPublisherAdapter implements EventPublisherPort`; `POST /events/simulate` → `{"publishedCount": <int>}`.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/kafka-publisher-and-simulation-endpoint`
 
-```bash
-git checkout main
-git checkout -b feat/kafka-publisher-and-simulation-endpoint
-```
-
-- [ ] **Step 2: Write the failing publisher test (mocked `KafkaTemplate`, no broker needed)**
+- [ ] **Step 2: Failing publisher test**
 
 ```java
 package com.intelbras.iotevents.domains.device.adapters.kafka;
@@ -1356,7 +1129,7 @@ package com.intelbras.iotevents.domains.device.adapters.kafka;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.intelbras.iotevents.config.KafkaTopics;
 import com.intelbras.iotevents.domains.device.core.DeviceEvent;
-import com.intelbras.iotevents.domains.device.core.DeviceType;
+import com.intelbras.iotevents.domains.device.core.EventCategory;
 import org.junit.jupiter.api.Test;
 import org.springframework.kafka.core.KafkaTemplate;
 
@@ -1370,36 +1143,36 @@ import static org.mockito.Mockito.verify;
 class KafkaEventPublisherAdapterTest {
 
     @Test
-    void shouldPublishToTheCameraTopicKeyedByDeviceId() {
+    void shouldPublishToThePropertyChangeTopicKeyedByDeviceId() {
         @SuppressWarnings("unchecked")
         KafkaTemplate<String, String> kafkaTemplate = mock(KafkaTemplate.class);
         KafkaEventPublisherAdapter adapter = new KafkaEventPublisherAdapter(kafkaTemplate, new ObjectMapper());
 
-        DeviceEvent event = new DeviceEvent("evt-1", "cam-001", DeviceType.CAMERA, "MOTION_DETECTED",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of("confidence", 0.9));
+        DeviceEvent event = new DeviceEvent("evt-1", "DEVICE-00014", EventCategory.PROPERTY_CHANGE, "iotProperty",
+            Instant.parse("2026-09-25T08:47:51.157000Z"), Map.of("properties", Map.of("11800", 3)));
 
         adapter.publish(event);
 
-        verify(kafkaTemplate).send(KafkaTopics.DEVICE_CAMERA_EVENTS, "cam-001", anyString());
+        verify(kafkaTemplate).send(KafkaTopics.DEVICE_PROPERTY_CHANGE_EVENTS, "DEVICE-00014", anyString());
     }
 
     @Test
-    void shouldPublishToTheGenericTopicForGenericDeviceType() {
+    void shouldPublishToTheOtherTopicForOtherCategory() {
         @SuppressWarnings("unchecked")
         KafkaTemplate<String, String> kafkaTemplate = mock(KafkaTemplate.class);
         KafkaEventPublisherAdapter adapter = new KafkaEventPublisherAdapter(kafkaTemplate, new ObjectMapper());
 
-        DeviceEvent event = new DeviceEvent("evt-2", "lock-001", DeviceType.GENERIC, "STATUS_CHANGE",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of());
+        DeviceEvent event = new DeviceEvent("evt-2", "SYNTHETIC-DLQ-004", EventCategory.OTHER, "upgradeFail",
+            Instant.parse("2026-09-25T10:03:00Z"), Map.of());
 
         adapter.publish(event);
 
-        verify(kafkaTemplate).send(KafkaTopics.DEVICE_GENERIC_EVENTS, "lock-001", anyString());
+        verify(kafkaTemplate).send(KafkaTopics.DEVICE_OTHER_EVENTS, "SYNTHETIC-DLQ-004", anyString());
     }
 }
 ```
 
-- [ ] **Step 3: Write the failing controller slice test**
+- [ ] **Step 3: Failing controller slice test**
 
 ```java
 package com.intelbras.iotevents.domains.device.adapters.web;
@@ -1427,21 +1200,18 @@ class EventSimulationControllerTest {
 
     @Test
     void shouldReturnPublishedCountFromTheUseCase() throws Exception {
-        when(simulateIngestionUseCase.execute()).thenReturn(12);
+        when(simulateIngestionUseCase.execute()).thenReturn(104);
 
         mockMvc.perform(post("/events/simulate"))
             .andExpect(status().isOk())
-            .andExpect(content().json("{\"publishedCount\":12}"));
+            .andExpect(content().json("{\"publishedCount\":104}"));
     }
 }
 ```
 
-- [ ] **Step 4: Run both tests to verify they fail**
+- [ ] **Step 4: Run, verify both fail** — `mvn -q test -Dtest=KafkaEventPublisherAdapterTest,EventSimulationControllerTest`
 
-Run: `mvn -q test -Dtest=KafkaEventPublisherAdapterTest,EventSimulationControllerTest`
-Expected: FAIL — `KafkaEventPublisherAdapter` and `EventSimulationController` do not exist yet.
-
-- [ ] **Step 5: Write `KafkaEventPublisherAdapter`**
+- [ ] **Step 5: `KafkaEventPublisherAdapter`**
 
 ```java
 package com.intelbras.iotevents.domains.device.adapters.kafka;
@@ -1450,7 +1220,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.intelbras.iotevents.common.logging.ExecutionLog;
 import com.intelbras.iotevents.config.KafkaTopics;
 import com.intelbras.iotevents.domains.device.core.DeviceEvent;
-import com.intelbras.iotevents.domains.device.core.DeviceType;
+import com.intelbras.iotevents.domains.device.core.EventCategory;
 import com.intelbras.iotevents.domains.device.core.port.EventPublisherPort;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
@@ -1473,9 +1243,9 @@ public class KafkaEventPublisherAdapter implements EventPublisherPort {
         ExecutionLog log = ExecutionLog.start(KafkaEventPublisherAdapter.class, "publish")
             .context("eventId", event.eventId())
             .context("deviceId", event.deviceId())
-            .context("deviceType", event.deviceType());
+            .context("eventCategory", event.eventCategory());
         try {
-            String topic = resolveTopic(event.deviceType());
+            String topic = resolveTopic(event.eventCategory());
             String payload = objectMapper.writeValueAsString(toWireMessage(event));
             log.context("topic", topic).step("Serialized device event to wire JSON");
 
@@ -1490,12 +1260,12 @@ public class KafkaEventPublisherAdapter implements EventPublisherPort {
         }
     }
 
-    private String resolveTopic(DeviceType deviceType) {
-        return switch (deviceType) {
-            case CAMERA -> KafkaTopics.DEVICE_CAMERA_EVENTS;
-            case SENSOR -> KafkaTopics.DEVICE_SENSOR_EVENTS;
-            case ALARM -> KafkaTopics.DEVICE_ALARM_EVENTS;
-            case GENERIC -> KafkaTopics.DEVICE_GENERIC_EVENTS;
+    private String resolveTopic(EventCategory eventCategory) {
+        return switch (eventCategory) {
+            case PROPERTY_CHANGE -> KafkaTopics.DEVICE_PROPERTY_CHANGE_EVENTS;
+            case STATUS_CHANGE -> KafkaTopics.DEVICE_STATUS_CHANGE_EVENTS;
+            case MOTION_DETECTION -> KafkaTopics.DEVICE_MOTION_DETECTION_EVENTS;
+            case OTHER -> KafkaTopics.DEVICE_OTHER_EVENTS;
         };
     }
 
@@ -1503,7 +1273,7 @@ public class KafkaEventPublisherAdapter implements EventPublisherPort {
         return Map.of(
             "eventId", event.eventId(),
             "deviceId", event.deviceId(),
-            "deviceType", event.deviceType().name(),
+            "eventCategory", event.eventCategory().name(),
             "eventType", event.eventType(),
             "timestamp", event.timestamp().toString(),
             "payload", event.payload());
@@ -1511,7 +1281,7 @@ public class KafkaEventPublisherAdapter implements EventPublisherPort {
 }
 ```
 
-- [ ] **Step 6: Write `EventSimulationController`**
+- [ ] **Step 6: `EventSimulationController`**
 
 ```java
 package com.intelbras.iotevents.domains.device.adapters.web;
@@ -1534,8 +1304,7 @@ public class EventSimulationController {
 
     @PostMapping("/simulate")
     public ResponseEntity<SimulationResponse> simulate() {
-        int publishedCount = simulateIngestionUseCase.execute();
-        return ResponseEntity.ok(new SimulationResponse(publishedCount));
+        return ResponseEntity.ok(new SimulationResponse(simulateIngestionUseCase.execute()));
     }
 
     public record SimulationResponse(int publishedCount) {
@@ -1543,9 +1312,7 @@ public class EventSimulationController {
 }
 ```
 
-- [ ] **Step 7: Register `SimulateIngestionUseCase` as a Spring bean**
-
-Create `src/main/java/com/intelbras/iotevents/domains/device/DeviceUseCaseConfig.java`:
+- [ ] **Step 7: Register the use case bean**
 
 ```java
 package com.intelbras.iotevents.domains.device;
@@ -1567,51 +1334,21 @@ public class DeviceUseCaseConfig {
 }
 ```
 
-- [ ] **Step 8: Run both tests to verify they pass**
-
-Run: `mvn -q test -Dtest=KafkaEventPublisherAdapterTest,EventSimulationControllerTest`
-Expected: `Tests run: 3, Failures: 0, Errors: 0`
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/domains/device/adapters/kafka src/main/java/com/intelbras/iotevents/domains/device/adapters/web src/main/java/com/intelbras/iotevents/domains/device/DeviceUseCaseConfig.java src/test/java/com/intelbras/iotevents/domains/device/adapters/kafka src/test/java/com/intelbras/iotevents/domains/device/adapters/web
-git commit -m "feat: add Kafka publisher adapter and simulation REST endpoint"
-```
-
-- [ ] **Step 10: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/kafka-publisher-and-simulation-endpoint
-git branch -d feat/kafka-publisher-and-simulation-endpoint
-```
+- [ ] **Step 8: Run, verify both pass** — `mvn -q test -Dtest=KafkaEventPublisherAdapterTest,EventSimulationControllerTest` → 3 passed
+- [ ] **Step 9: Commit** — `git add src/main/java/com/intelbras/iotevents/domains/device/adapters/kafka src/main/java/com/intelbras/iotevents/domains/device/adapters/web src/main/java/com/intelbras/iotevents/domains/device/DeviceUseCaseConfig.java src/test/java/com/intelbras/iotevents/domains/device/adapters/kafka src/test/java/com/intelbras/iotevents/domains/device/adapters/web && git commit -m "feat: add Kafka publisher adapter and simulation REST endpoint"`
+- [ ] **Step 10: Merge** — `git checkout main && git merge --no-ff feat/kafka-publisher-and-simulation-endpoint && git branch -d feat/kafka-publisher-and-simulation-endpoint`
 
 ---
 
 ### Task 8: Audit domain core models
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/IncomingDeviceEvent.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/AuditRecord.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/AuditQueryFilter.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/KafkaMessageContext.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/error/AuditDomainError.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/error/SimulatedProcessingFailureError.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/port/AuditRepositoryPort.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/audit/core/AuditRecordTest.java`
+**Files:** Create `domains/audit/core/{IncomingDeviceEvent,AuditRecord,AuditQueryFilter,KafkaMessageContext}.java`, `domains/audit/core/error/{AuditDomainError,SimulatedProcessingFailureError}.java`, `domains/audit/core/port/AuditRepositoryPort.java`; Test `AuditRecordTest.java`.
 
-**Interfaces:**
-- Produces: `IncomingDeviceEvent(String eventId, String deviceId, String deviceType, String eventType, Instant timestamp, Map<String,Object> payload)` — audit's own representation, deliberately not importing `device.core.DeviceEvent`; `AuditRecord(String dedupKey, String deviceId, String deviceType, String eventType, String generalInfo, Instant consumedAt, Instant createdAt)` with static factory `AuditRecord.processedNow(IncomingDeviceEvent, String generalInfo)`; `AuditQueryFilter(String deviceId, String eventType, Instant from, Instant to)`; `KafkaMessageContext(String topic, int partition, long offset, String key)`; `AuditRepositoryPort.save(AuditRecord)`, `.existsByDedupKey(String): boolean`, `.query(AuditQueryFilter): List<AuditRecord>`.
+**Interfaces:** `IncomingDeviceEvent(String eventId, String deviceId, String eventCategory, String eventType, Instant timestamp, Map<String,Object> payload)` — audit's own representation, never `device.core.DeviceEvent`; `AuditRecord(String dedupKey, String deviceId, String eventCategory, String eventType, String generalInfo, Instant consumedAt, Instant createdAt)` with `AuditRecord.processedNow(IncomingDeviceEvent, String)`; `AuditQueryFilter(String deviceId, String eventType, Instant from, Instant to)`; `KafkaMessageContext(String topic, int partition, long offset, String key)`; `AuditRepositoryPort.save/existsByDedupKey/query`.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/audit-core-models`
 
-```bash
-git checkout main
-git checkout -b feat/audit-core-models
-```
-
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 2: Failing test**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core;
@@ -1627,27 +1364,24 @@ class AuditRecordTest {
 
     @Test
     void shouldBuildAProcessedAuditRecordFromAnIncomingEvent() {
-        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "cam-001", "CAMERA", "MOTION_DETECTED",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of("confidence", 0.9));
+        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "DEVICE-00014", "PROPERTY_CHANGE", "iotProperty",
+            Instant.parse("2026-09-25T08:47:51.157000Z"), Map.of("properties", Map.of("11800", 3)));
 
-        AuditRecord record = AuditRecord.processedNow(event, "Camera cam-001 reported MOTION_DETECTED");
+        AuditRecord record = AuditRecord.processedNow(event, "Device DEVICE-00014 reported a property change");
 
         assertThat(record.dedupKey()).isEqualTo("evt-1");
-        assertThat(record.deviceId()).isEqualTo("cam-001");
-        assertThat(record.deviceType()).isEqualTo("CAMERA");
-        assertThat(record.eventType()).isEqualTo("MOTION_DETECTED");
-        assertThat(record.generalInfo()).isEqualTo("Camera cam-001 reported MOTION_DETECTED");
+        assertThat(record.deviceId()).isEqualTo("DEVICE-00014");
+        assertThat(record.eventCategory()).isEqualTo("PROPERTY_CHANGE");
+        assertThat(record.eventType()).isEqualTo("iotProperty");
+        assertThat(record.generalInfo()).isEqualTo("Device DEVICE-00014 reported a property change");
         assertThat(record.consumedAt()).isEqualTo(record.createdAt());
     }
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [ ] **Step 3: Run, verify fails** — `mvn -q test -Dtest=AuditRecordTest`
 
-Run: `mvn -q test -Dtest=AuditRecordTest`
-Expected: FAIL — `IncomingDeviceEvent` and `AuditRecord` do not exist yet.
-
-- [ ] **Step 4: Write `IncomingDeviceEvent`**
+- [ ] **Step 4: `IncomingDeviceEvent`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core;
@@ -1655,30 +1389,30 @@ package com.intelbras.iotevents.domains.audit.core;
 import java.time.Instant;
 import java.util.Map;
 
-public record IncomingDeviceEvent(String eventId, String deviceId, String deviceType, String eventType,
+public record IncomingDeviceEvent(String eventId, String deviceId, String eventCategory, String eventType,
                                    Instant timestamp, Map<String, Object> payload) {
 }
 ```
 
-- [ ] **Step 5: Write `AuditRecord`**
+- [ ] **Step 5: `AuditRecord`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core;
 
 import java.time.Instant;
 
-public record AuditRecord(String dedupKey, String deviceId, String deviceType, String eventType,
+public record AuditRecord(String dedupKey, String deviceId, String eventCategory, String eventType,
                            String generalInfo, Instant consumedAt, Instant createdAt) {
 
     public static AuditRecord processedNow(IncomingDeviceEvent event, String generalInfo) {
         Instant now = Instant.now();
-        return new AuditRecord(event.eventId(), event.deviceId(), event.deviceType(), event.eventType(),
+        return new AuditRecord(event.eventId(), event.deviceId(), event.eventCategory(), event.eventType(),
             generalInfo, now, now);
     }
 }
 ```
 
-- [ ] **Step 6: Write `AuditQueryFilter` and `KafkaMessageContext`**
+- [ ] **Step 6: `AuditQueryFilter` and `KafkaMessageContext`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core;
@@ -1696,7 +1430,7 @@ public record KafkaMessageContext(String topic, int partition, long offset, Stri
 }
 ```
 
-- [ ] **Step 7: Write the error hierarchy**
+- [ ] **Step 7: Error hierarchy**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core.error;
@@ -1718,7 +1452,7 @@ public class SimulatedProcessingFailureError extends AuditDomainError {
 }
 ```
 
-- [ ] **Step 8: Write `AuditRepositoryPort`**
+- [ ] **Step 8: `AuditRepositoryPort`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core.port;
@@ -1737,50 +1471,21 @@ public interface AuditRepositoryPort {
 }
 ```
 
-- [ ] **Step 9: Run the test to verify it passes**
-
-Run: `mvn -q test -Dtest=AuditRecordTest`
-Expected: `Tests run: 1, Failures: 0, Errors: 0`
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/domains/audit/core src/test/java/com/intelbras/iotevents/domains/audit/core
-git commit -m "feat: add audit domain core models and repository port"
-```
-
-- [ ] **Step 11: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/audit-core-models
-git branch -d feat/audit-core-models
-```
+- [ ] **Step 9: Run, verify passes** — `mvn -q test -Dtest=AuditRecordTest` → 1 passed
+- [ ] **Step 10: Commit** — `git add src/main/java/com/intelbras/iotevents/domains/audit/core src/test/java/com/intelbras/iotevents/domains/audit/core && git commit -m "feat: add audit domain core models and repository port"`
+- [ ] **Step 11: Merge** — `git checkout main && git merge --no-ff feat/audit-core-models && git branch -d feat/audit-core-models`
 
 ---
 
-### Task 9: Audit event handlers (per device type)
+### Task 9: Audit event handlers (per `EventCategory`)
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/handler/DeviceEventAuditHandler.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/handler/CameraEventAuditHandler.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/handler/SensorEventAuditHandler.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/handler/AlarmEventAuditHandler.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/handler/GenericEventAuditHandler.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/audit/core/handler/DeviceEventAuditHandlersTest.java`
+**Files:** Create `domains/audit/core/handler/{DeviceEventAuditHandler,PropertyChangeEventAuditHandler,StatusChangeEventAuditHandler,MotionDetectionEventAuditHandler,OtherEventAuditHandler}.java`; Test `DeviceEventAuditHandlersTest.java`.
 
-**Interfaces:**
-- Consumes: `IncomingDeviceEvent` (Task 8).
-- Produces: `DeviceEventAuditHandler.supports(String deviceType): boolean` and `.handle(IncomingDeviceEvent): String`, implemented by four `@Component`s keyed to `"CAMERA"`, `"SENSOR"`, `"ALARM"`, `"GENERIC"` respectively. Task 10's use case resolves one of these four by `supports()`, with the `GenericEventAuditHandler` instance injected separately as the explicit fallback.
+**Interfaces:** `DeviceEventAuditHandler.supports(String eventCategory): boolean`, `.handle(IncomingDeviceEvent): String`. `OtherEventAuditHandler` is the designated fallback (Task 10 injects it separately).
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/audit-device-event-handlers`
 
-```bash
-git checkout main
-git checkout -b feat/audit-device-event-handlers
-```
-
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 2: Failing test**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core.handler;
@@ -1795,62 +1500,55 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class DeviceEventAuditHandlersTest {
 
-    private final CameraEventAuditHandler cameraHandler = new CameraEventAuditHandler();
-    private final SensorEventAuditHandler sensorHandler = new SensorEventAuditHandler();
-    private final AlarmEventAuditHandler alarmHandler = new AlarmEventAuditHandler();
-    private final GenericEventAuditHandler genericHandler = new GenericEventAuditHandler();
+    private final PropertyChangeEventAuditHandler propertyChangeHandler = new PropertyChangeEventAuditHandler();
+    private final StatusChangeEventAuditHandler statusChangeHandler = new StatusChangeEventAuditHandler();
+    private final MotionDetectionEventAuditHandler motionDetectionHandler = new MotionDetectionEventAuditHandler();
+    private final OtherEventAuditHandler otherHandler = new OtherEventAuditHandler();
 
     @Test
-    void cameraHandlerShouldSupportOnlyCameraDeviceType() {
-        assertThat(cameraHandler.supports("CAMERA")).isTrue();
-        assertThat(cameraHandler.supports("SENSOR")).isFalse();
+    void propertyChangeHandlerShouldSupportOnlyItsCategory() {
+        assertThat(propertyChangeHandler.supports("PROPERTY_CHANGE")).isTrue();
+        assertThat(propertyChangeHandler.supports("STATUS_CHANGE")).isFalse();
     }
 
     @Test
-    void cameraHandlerShouldDescribeTheEvent() {
-        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "cam-001", "CAMERA", "MOTION_DETECTED",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of("confidence", 0.9));
+    void propertyChangeHandlerShouldDescribeTheEvent() {
+        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "DEVICE-00014", "PROPERTY_CHANGE", "iotProperty",
+            Instant.parse("2026-09-25T08:47:51.157000Z"), Map.of("properties", Map.of("11800", 3)));
 
-        String generalInfo = cameraHandler.handle(event);
-
-        assertThat(generalInfo).contains("cam-001").contains("MOTION_DETECTED");
+        assertThat(propertyChangeHandler.handle(event)).contains("DEVICE-00014").contains("iotProperty");
     }
 
     @Test
-    void sensorHandlerShouldSupportOnlySensorDeviceType() {
-        assertThat(sensorHandler.supports("SENSOR")).isTrue();
-        assertThat(sensorHandler.supports("CAMERA")).isFalse();
+    void statusChangeHandlerShouldSupportOnlyItsCategory() {
+        assertThat(statusChangeHandler.supports("STATUS_CHANGE")).isTrue();
+        assertThat(statusChangeHandler.supports("MOTION_DETECTION")).isFalse();
     }
 
     @Test
-    void alarmHandlerShouldIncludeStatusFromPayload() {
-        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-2", "alarm-001", "ALARM", "STATUS_CHANGE",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of("status", "ARMED"));
+    void motionDetectionHandlerShouldDescribeTheEvent() {
+        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-2", "DEVICE-00066", "MOTION_DETECTION", "videoMotion",
+            Instant.parse("2026-09-25T09:30:11Z"), Map.of());
 
-        String generalInfo = alarmHandler.handle(event);
-
-        assertThat(generalInfo).contains("alarm-001").contains("ARMED");
+        assertThat(motionDetectionHandler.handle(event)).contains("DEVICE-00066").contains("videoMotion");
     }
 
     @Test
-    void genericHandlerShouldSupportOnlyGenericDeviceTypeButDescribeAnyEvent() {
-        assertThat(genericHandler.supports("GENERIC")).isTrue();
-        assertThat(genericHandler.supports("CAMERA")).isFalse();
+    void otherHandlerShouldSupportOnlyOtherCategoryButDescribeAnyEvent() {
+        assertThat(otherHandler.supports("OTHER")).isTrue();
+        assertThat(otherHandler.supports("PROPERTY_CHANGE")).isFalse();
 
-        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-3", "lock-001", "GENERIC", "STATUS_CHANGE",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of());
+        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-3", "FJ1K2001704PS", "OTHER", "informationTransfer",
+            Instant.parse("2026-09-25T09:45:37Z"), Map.of());
 
-        assertThat(genericHandler.handle(event)).contains("lock-001");
+        assertThat(otherHandler.handle(event)).contains("FJ1K2001704PS");
     }
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [ ] **Step 3: Run, verify fails** — `mvn -q test -Dtest=DeviceEventAuditHandlersTest`
 
-Run: `mvn -q test -Dtest=DeviceEventAuditHandlersTest`
-Expected: FAIL — handler classes do not exist yet.
-
-- [ ] **Step 4: Write `DeviceEventAuditHandler`**
+- [ ] **Step 4: `DeviceEventAuditHandler`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core.handler;
@@ -1858,13 +1556,13 @@ package com.intelbras.iotevents.domains.audit.core.handler;
 import com.intelbras.iotevents.domains.audit.core.IncomingDeviceEvent;
 
 public interface DeviceEventAuditHandler {
-    boolean supports(String deviceType);
+    boolean supports(String eventCategory);
 
     String handle(IncomingDeviceEvent event);
 }
 ```
 
-- [ ] **Step 5: Write the four handlers**
+- [ ] **Step 5: The four handlers**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core.handler;
@@ -1873,16 +1571,17 @@ import com.intelbras.iotevents.domains.audit.core.IncomingDeviceEvent;
 import org.springframework.stereotype.Component;
 
 @Component
-public class CameraEventAuditHandler implements DeviceEventAuditHandler {
+public class PropertyChangeEventAuditHandler implements DeviceEventAuditHandler {
 
     @Override
-    public boolean supports(String deviceType) {
-        return "CAMERA".equalsIgnoreCase(deviceType);
+    public boolean supports(String eventCategory) {
+        return "PROPERTY_CHANGE".equalsIgnoreCase(eventCategory);
     }
 
     @Override
     public String handle(IncomingDeviceEvent event) {
-        return "Camera " + event.deviceId() + " reported " + event.eventType() + " at " + event.timestamp();
+        return "Device " + event.deviceId() + " reported a property change (" + event.eventType()
+            + ") with payload " + event.payload() + " at " + event.timestamp();
     }
 }
 ```
@@ -1894,16 +1593,17 @@ import com.intelbras.iotevents.domains.audit.core.IncomingDeviceEvent;
 import org.springframework.stereotype.Component;
 
 @Component
-public class SensorEventAuditHandler implements DeviceEventAuditHandler {
+public class StatusChangeEventAuditHandler implements DeviceEventAuditHandler {
 
     @Override
-    public boolean supports(String deviceType) {
-        return "SENSOR".equalsIgnoreCase(deviceType);
+    public boolean supports(String eventCategory) {
+        return "STATUS_CHANGE".equalsIgnoreCase(eventCategory);
     }
 
     @Override
     public String handle(IncomingDeviceEvent event) {
-        return "Sensor " + event.deviceId() + " triggered " + event.eventType() + " at " + event.timestamp();
+        return "Device " + event.deviceId() + " changed connectivity status to " + event.eventType()
+            + " at " + event.timestamp();
     }
 }
 ```
@@ -1915,18 +1615,16 @@ import com.intelbras.iotevents.domains.audit.core.IncomingDeviceEvent;
 import org.springframework.stereotype.Component;
 
 @Component
-public class AlarmEventAuditHandler implements DeviceEventAuditHandler {
+public class MotionDetectionEventAuditHandler implements DeviceEventAuditHandler {
 
     @Override
-    public boolean supports(String deviceType) {
-        return "ALARM".equalsIgnoreCase(deviceType);
+    public boolean supports(String eventCategory) {
+        return "MOTION_DETECTION".equalsIgnoreCase(eventCategory);
     }
 
     @Override
     public String handle(IncomingDeviceEvent event) {
-        Object status = event.payload().get("status");
-        return "Alarm " + event.deviceId() + " changed status to " + status
-            + " (" + event.eventType() + ") at " + event.timestamp();
+        return "Device " + event.deviceId() + " detected motion (" + event.eventType() + ") at " + event.timestamp();
     }
 }
 ```
@@ -1938,64 +1636,35 @@ import com.intelbras.iotevents.domains.audit.core.IncomingDeviceEvent;
 import org.springframework.stereotype.Component;
 
 @Component
-public class GenericEventAuditHandler implements DeviceEventAuditHandler {
+public class OtherEventAuditHandler implements DeviceEventAuditHandler {
 
     @Override
-    public boolean supports(String deviceType) {
-        return "GENERIC".equalsIgnoreCase(deviceType);
+    public boolean supports(String eventCategory) {
+        return "OTHER".equalsIgnoreCase(eventCategory);
     }
 
     @Override
     public String handle(IncomingDeviceEvent event) {
-        return "Device " + event.deviceId() + " (" + event.deviceType() + ") reported "
-            + event.eventType() + " at " + event.timestamp();
+        return "Device " + event.deviceId() + " reported " + event.eventType() + " at " + event.timestamp();
     }
 }
 ```
 
-- [ ] **Step 6: Run the test to verify it passes**
-
-Run: `mvn -q test -Dtest=DeviceEventAuditHandlersTest`
-Expected: `Tests run: 5, Failures: 0, Errors: 0`
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/domains/audit/core/handler src/test/java/com/intelbras/iotevents/domains/audit/core/handler
-git commit -m "feat: add per-device-type audit event handlers"
-```
-
-- [ ] **Step 8: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/audit-device-event-handlers
-git branch -d feat/audit-device-event-handlers
-```
+- [ ] **Step 6: Run, verify passes** — `mvn -q test -Dtest=DeviceEventAuditHandlersTest` → 5 passed
+- [ ] **Step 7: Commit** — `git add src/main/java/com/intelbras/iotevents/domains/audit/core/handler src/test/java/com/intelbras/iotevents/domains/audit/core/handler && git commit -m "feat: add per-event-category audit handlers"`
+- [ ] **Step 8: Merge** — `git checkout main && git merge --no-ff feat/audit-device-event-handlers && git branch -d feat/audit-device-event-handlers`
 
 ---
 
 ### Task 10: Audit use cases + metrics
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/common/metrics/EventMetrics.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/usecase/RecordDeviceEventAuditUseCase.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/core/usecase/QueryAuditsUseCase.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/audit/core/usecase/RecordDeviceEventAuditUseCaseTest.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/audit/core/usecase/QueryAuditsUseCaseTest.java`
+**Files:** Create `common/metrics/EventMetrics.java`, `domains/audit/core/usecase/{RecordDeviceEventAuditUseCase,QueryAuditsUseCase}.java`; Test both.
 
-**Interfaces:**
-- Consumes: `AuditRepositoryPort`, `IncomingDeviceEvent`, `AuditRecord`, `AuditQueryFilter`, `KafkaMessageContext` (Task 8); `DeviceEventAuditHandler` + four impls (Task 9).
-- Produces: `RecordDeviceEventAuditUseCase(AuditRepositoryPort, List<DeviceEventAuditHandler>, GenericEventAuditHandler, EventMetrics)` with `execute(IncomingDeviceEvent, KafkaMessageContext): void`; `QueryAuditsUseCase(AuditRepositoryPort)` with `execute(AuditQueryFilter): List<AuditRecord>`. Task 13 (listeners) and Task 14 (controller) call these directly.
+**Interfaces:** `RecordDeviceEventAuditUseCase(AuditRepositoryPort, List<DeviceEventAuditHandler>, OtherEventAuditHandler, EventMetrics).execute(IncomingDeviceEvent, KafkaMessageContext)`; `QueryAuditsUseCase(AuditRepositoryPort).execute(AuditQueryFilter): List<AuditRecord>`.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/audit-use-cases`
 
-```bash
-git checkout main
-git checkout -b feat/audit-use-cases
-```
-
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 2: Failing tests**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core.usecase;
@@ -2005,11 +1674,11 @@ import com.intelbras.iotevents.domains.audit.core.AuditRecord;
 import com.intelbras.iotevents.domains.audit.core.IncomingDeviceEvent;
 import com.intelbras.iotevents.domains.audit.core.KafkaMessageContext;
 import com.intelbras.iotevents.domains.audit.core.error.SimulatedProcessingFailureError;
-import com.intelbras.iotevents.domains.audit.core.handler.AlarmEventAuditHandler;
-import com.intelbras.iotevents.domains.audit.core.handler.CameraEventAuditHandler;
 import com.intelbras.iotevents.domains.audit.core.handler.DeviceEventAuditHandler;
-import com.intelbras.iotevents.domains.audit.core.handler.GenericEventAuditHandler;
-import com.intelbras.iotevents.domains.audit.core.handler.SensorEventAuditHandler;
+import com.intelbras.iotevents.domains.audit.core.handler.MotionDetectionEventAuditHandler;
+import com.intelbras.iotevents.domains.audit.core.handler.OtherEventAuditHandler;
+import com.intelbras.iotevents.domains.audit.core.handler.PropertyChangeEventAuditHandler;
+import com.intelbras.iotevents.domains.audit.core.handler.StatusChangeEventAuditHandler;
 import com.intelbras.iotevents.domains.audit.core.port.AuditRepositoryPort;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
@@ -2028,21 +1697,22 @@ import static org.mockito.Mockito.when;
 
 class RecordDeviceEventAuditUseCaseTest {
 
-    private final GenericEventAuditHandler genericHandler = new GenericEventAuditHandler();
+    private final OtherEventAuditHandler otherHandler = new OtherEventAuditHandler();
     private final List<DeviceEventAuditHandler> handlers = List.of(
-        new CameraEventAuditHandler(), new SensorEventAuditHandler(), new AlarmEventAuditHandler(), genericHandler);
+        new PropertyChangeEventAuditHandler(), new StatusChangeEventAuditHandler(),
+        new MotionDetectionEventAuditHandler(), otherHandler);
     private final EventMetrics eventMetrics = new EventMetrics(new SimpleMeterRegistry());
-    private final KafkaMessageContext context = new KafkaMessageContext("device.camera.events", 0, 1L, "cam-001");
+    private final KafkaMessageContext context = new KafkaMessageContext("device.property-change.events", 0, 1L, "DEVICE-00014");
 
     @Test
     void shouldPersistAnAuditRecordForANewEvent() {
         AuditRepositoryPort repositoryPort = mock(AuditRepositoryPort.class);
         when(repositoryPort.existsByDedupKey("evt-1")).thenReturn(false);
         RecordDeviceEventAuditUseCase useCase =
-            new RecordDeviceEventAuditUseCase(repositoryPort, handlers, genericHandler, eventMetrics);
+            new RecordDeviceEventAuditUseCase(repositoryPort, handlers, otherHandler, eventMetrics);
 
-        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "cam-001", "CAMERA", "MOTION_DETECTED",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of("confidence", 0.9));
+        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "DEVICE-00014", "PROPERTY_CHANGE", "iotProperty",
+            Instant.parse("2026-09-25T08:47:51.157000Z"), Map.of("properties", Map.of("11800", 3)));
 
         useCase.execute(event, context);
 
@@ -2054,10 +1724,10 @@ class RecordDeviceEventAuditUseCaseTest {
         AuditRepositoryPort repositoryPort = mock(AuditRepositoryPort.class);
         when(repositoryPort.existsByDedupKey("evt-1")).thenReturn(true);
         RecordDeviceEventAuditUseCase useCase =
-            new RecordDeviceEventAuditUseCase(repositoryPort, handlers, genericHandler, eventMetrics);
+            new RecordDeviceEventAuditUseCase(repositoryPort, handlers, otherHandler, eventMetrics);
 
-        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "cam-001", "CAMERA", "MOTION_DETECTED",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of());
+        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "DEVICE-00014", "PROPERTY_CHANGE", "iotProperty",
+            Instant.parse("2026-09-25T08:47:51.157000Z"), Map.of());
 
         useCase.execute(event, context);
 
@@ -2069,26 +1739,25 @@ class RecordDeviceEventAuditUseCaseTest {
         AuditRepositoryPort repositoryPort = mock(AuditRepositoryPort.class);
         when(repositoryPort.existsByDedupKey("evt-1")).thenReturn(false);
         RecordDeviceEventAuditUseCase useCase =
-            new RecordDeviceEventAuditUseCase(repositoryPort, handlers, genericHandler, eventMetrics);
+            new RecordDeviceEventAuditUseCase(repositoryPort, handlers, otherHandler, eventMetrics);
 
-        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "alarm-001", "ALARM", "STATUS_CHANGE",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of("simulateFailure", true));
+        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "SYNTHETIC-DLQ-001", "PROPERTY_CHANGE", "iotProperty",
+            Instant.parse("2026-09-25T10:00:00Z"), Map.of("simulateFailure", true));
 
-        assertThatThrownBy(() -> useCase.execute(event, context))
-            .isInstanceOf(SimulatedProcessingFailureError.class);
+        assertThatThrownBy(() -> useCase.execute(event, context)).isInstanceOf(SimulatedProcessingFailureError.class);
 
         verify(repositoryPort, never()).save(any(AuditRecord.class));
     }
 
     @Test
-    void shouldFallBackToGenericHandlerWhenNoSpecificHandlerMatches() {
+    void shouldFallBackToOtherHandlerWhenNoSpecificHandlerMatches() {
         AuditRepositoryPort repositoryPort = mock(AuditRepositoryPort.class);
         when(repositoryPort.existsByDedupKey("evt-9")).thenReturn(false);
         RecordDeviceEventAuditUseCase useCase =
-            new RecordDeviceEventAuditUseCase(repositoryPort, handlers, genericHandler, eventMetrics);
+            new RecordDeviceEventAuditUseCase(repositoryPort, handlers, otherHandler, eventMetrics);
 
-        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-9", "lock-001", "LOCK", "STATUS_CHANGE",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of());
+        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-9", "FJ1K2001704PS", "OTHER", "informationTransfer",
+            Instant.parse("2026-09-25T09:45:37Z"), Map.of());
 
         useCase.execute(event, context);
 
@@ -2117,24 +1786,19 @@ class QueryAuditsUseCaseTest {
     @Test
     void shouldReturnWhateverTheRepositoryPortReturnsForTheGivenFilter() {
         AuditRepositoryPort repositoryPort = mock(AuditRepositoryPort.class);
-        AuditQueryFilter filter = new AuditQueryFilter("cam-001", null, null, null);
-        AuditRecord record = new AuditRecord("evt-1", "cam-001", "CAMERA", "MOTION_DETECTED",
-            "Camera cam-001 reported MOTION_DETECTED", Instant.now(), Instant.now());
+        AuditQueryFilter filter = new AuditQueryFilter("DEVICE-00014", null, null, null);
+        AuditRecord record = new AuditRecord("evt-1", "DEVICE-00014", "PROPERTY_CHANGE", "iotProperty",
+            "Device DEVICE-00014 reported a property change", Instant.now(), Instant.now());
         when(repositoryPort.query(filter)).thenReturn(List.of(record));
 
-        QueryAuditsUseCase useCase = new QueryAuditsUseCase(repositoryPort);
-
-        assertThat(useCase.execute(filter)).containsExactly(record);
+        assertThat(new QueryAuditsUseCase(repositoryPort).execute(filter)).containsExactly(record);
     }
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [ ] **Step 3: Run, verify fails** — `mvn -q test -Dtest=RecordDeviceEventAuditUseCaseTest,QueryAuditsUseCaseTest`
 
-Run: `mvn -q test -Dtest=RecordDeviceEventAuditUseCaseTest,QueryAuditsUseCaseTest`
-Expected: FAIL — `EventMetrics`, `RecordDeviceEventAuditUseCase`, `QueryAuditsUseCase` do not exist yet.
-
-- [ ] **Step 4: Write `EventMetrics`**
+- [ ] **Step 4: `EventMetrics`**
 
 ```java
 package com.intelbras.iotevents.common.metrics;
@@ -2152,14 +1816,11 @@ public class EventMetrics {
 
     public EventMetrics(MeterRegistry registry) {
         this.processedCounter = Counter.builder("device_events_processed_total")
-            .description("Number of device events successfully processed and audited")
-            .register(registry);
+            .description("Number of device events successfully processed and audited").register(registry);
         this.duplicateCounter = Counter.builder("device_events_duplicate_total")
-            .description("Number of device events skipped as duplicates")
-            .register(registry);
+            .description("Number of device events skipped as duplicates").register(registry);
         this.dlqCounter = Counter.builder("device_events_dlq_total")
-            .description("Number of device events sent to a dead-letter topic")
-            .register(registry);
+            .description("Number of device events sent to a dead-letter topic").register(registry);
     }
 
     public void incrementProcessed() {
@@ -2176,7 +1837,7 @@ public class EventMetrics {
 }
 ```
 
-- [ ] **Step 5: Write `RecordDeviceEventAuditUseCase`**
+- [ ] **Step 5: `RecordDeviceEventAuditUseCase`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core.usecase;
@@ -2188,7 +1849,7 @@ import com.intelbras.iotevents.domains.audit.core.IncomingDeviceEvent;
 import com.intelbras.iotevents.domains.audit.core.KafkaMessageContext;
 import com.intelbras.iotevents.domains.audit.core.error.SimulatedProcessingFailureError;
 import com.intelbras.iotevents.domains.audit.core.handler.DeviceEventAuditHandler;
-import com.intelbras.iotevents.domains.audit.core.handler.GenericEventAuditHandler;
+import com.intelbras.iotevents.domains.audit.core.handler.OtherEventAuditHandler;
 import com.intelbras.iotevents.domains.audit.core.port.AuditRepositoryPort;
 
 import java.util.List;
@@ -2198,12 +1859,12 @@ public class RecordDeviceEventAuditUseCase {
 
     private final AuditRepositoryPort auditRepositoryPort;
     private final List<DeviceEventAuditHandler> handlers;
-    private final GenericEventAuditHandler fallbackHandler;
+    private final OtherEventAuditHandler fallbackHandler;
     private final EventMetrics eventMetrics;
 
     public RecordDeviceEventAuditUseCase(AuditRepositoryPort auditRepositoryPort,
                                           List<DeviceEventAuditHandler> handlers,
-                                          GenericEventAuditHandler fallbackHandler,
+                                          OtherEventAuditHandler fallbackHandler,
                                           EventMetrics eventMetrics) {
         this.auditRepositoryPort = auditRepositoryPort;
         this.handlers = handlers;
@@ -2215,7 +1876,7 @@ public class RecordDeviceEventAuditUseCase {
         ExecutionLog log = ExecutionLog.start(RecordDeviceEventAuditUseCase.class, "execute")
             .context("eventId", event.eventId())
             .context("deviceId", event.deviceId())
-            .context("deviceType", event.deviceType())
+            .context("eventCategory", event.eventCategory())
             .context("eventType", event.eventType())
             .context("topic", kafkaCtx.topic())
             .context("partition", kafkaCtx.partition())
@@ -2235,14 +1896,12 @@ public class RecordDeviceEventAuditUseCase {
 
             if (Boolean.TRUE.equals(event.payload().get("simulateFailure"))) {
                 log.step("Detected simulateFailure flag in payload");
-                throw new SimulatedProcessingFailureError(
-                    "Simulated processing failure for eventId=" + event.eventId());
+                throw new SimulatedProcessingFailureError("Simulated processing failure for eventId=" + event.eventId());
             }
 
-            DeviceEventAuditHandler handler = resolveHandler(event.deviceType());
+            DeviceEventAuditHandler handler = resolveHandler(event.eventCategory());
             String generalInfo = handler.handle(event);
-            log.step("Built general info via " + handler.getClass().getSimpleName(),
-                Map.of("generalInfo", generalInfo));
+            log.step("Built general info via " + handler.getClass().getSimpleName(), Map.of("generalInfo", generalInfo));
 
             auditRepositoryPort.save(AuditRecord.processedNow(event, generalInfo));
             eventMetrics.incrementProcessed();
@@ -2256,16 +1915,16 @@ public class RecordDeviceEventAuditUseCase {
         }
     }
 
-    private DeviceEventAuditHandler resolveHandler(String deviceType) {
+    private DeviceEventAuditHandler resolveHandler(String eventCategory) {
         return handlers.stream()
-            .filter(handler -> handler != fallbackHandler && handler.supports(deviceType))
+            .filter(handler -> handler != fallbackHandler && handler.supports(eventCategory))
             .findFirst()
             .orElse(fallbackHandler);
     }
 }
 ```
 
-- [ ] **Step 6: Write `QueryAuditsUseCase`**
+- [ ] **Step 6: `QueryAuditsUseCase`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.core.usecase;
@@ -2307,57 +1966,28 @@ public class QueryAuditsUseCase {
 }
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
-
-Run: `mvn -q test -Dtest=RecordDeviceEventAuditUseCaseTest,QueryAuditsUseCaseTest`
-Expected: `Tests run: 5, Failures: 0, Errors: 0`
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/common/metrics src/main/java/com/intelbras/iotevents/domains/audit/core/usecase src/test/java/com/intelbras/iotevents/domains/audit/core/usecase
-git commit -m "feat: add audit use cases and event metrics"
-```
-
-- [ ] **Step 9: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/audit-use-cases
-git branch -d feat/audit-use-cases
-```
+- [ ] **Step 7: Run, verify passes** — `mvn -q test -Dtest=RecordDeviceEventAuditUseCaseTest,QueryAuditsUseCaseTest` → 5 passed
+- [ ] **Step 8: Commit** — `git add src/main/java/com/intelbras/iotevents/common/metrics src/main/java/com/intelbras/iotevents/domains/audit/core/usecase src/test/java/com/intelbras/iotevents/domains/audit/core/usecase && git commit -m "feat: add audit use cases and event metrics"`
+- [ ] **Step 9: Merge** — `git checkout main && git merge --no-ff feat/audit-use-cases && git branch -d feat/audit-use-cases`
 
 ---
 
 ### Task 11: Audit persistence adapter (Postgres/JPA)
 
-**Files:**
-- Create: `src/main/resources/db/migration/V1__create_audit_records_table.sql`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/persistence/AuditJpaEntity.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/persistence/AuditJpaRepository.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/persistence/AuditMapper.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/persistence/JpaAuditRepositoryAdapter.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/audit/adapters/persistence/AuditMapperTest.java`
+**Files:** Create `src/main/resources/db/migration/V1__create_audit_records_table.sql`, `domains/audit/adapters/persistence/{AuditJpaEntity,AuditJpaRepository,AuditMapper,JpaAuditRepositoryAdapter}.java`; Test `AuditMapperTest.java`.
 
-**Interfaces:**
-- Consumes: `AuditRecord`, `AuditQueryFilter`, `AuditRepositoryPort` (Task 8).
-- Produces: `JpaAuditRepositoryAdapter implements AuditRepositoryPort`, backed by `audit_records` table. No `core` type ever exposes `AuditJpaEntity`.
+**Interfaces:** `JpaAuditRepositoryAdapter implements AuditRepositoryPort`, backed by `audit_records` (column `event_category`, not `device_type`).
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/audit-persistence-adapter`
 
-```bash
-git checkout main
-git checkout -b feat/audit-persistence-adapter
-```
-
-- [ ] **Step 2: Write the Flyway migration**
+- [ ] **Step 2: Flyway migration**
 
 ```sql
 CREATE TABLE audit_records (
     id BIGSERIAL PRIMARY KEY,
     event_id VARCHAR(255) NOT NULL,
     device_id VARCHAR(255) NOT NULL,
-    device_type VARCHAR(50) NOT NULL,
+    event_category VARCHAR(50) NOT NULL,
     event_type VARCHAR(100) NOT NULL,
     general_info TEXT NOT NULL,
     consumed_at TIMESTAMP NOT NULL,
@@ -2369,7 +1999,7 @@ CREATE INDEX idx_audit_records_device_id ON audit_records (device_id);
 CREATE INDEX idx_audit_records_event_type ON audit_records (event_type);
 ```
 
-- [ ] **Step 3: Write the failing mapper test (pure mapping, no DB)**
+- [ ] **Step 3: Failing mapper test**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.persistence;
@@ -2386,23 +2016,19 @@ class AuditMapperTest {
     @Test
     void shouldRoundTripBetweenDomainAndJpaEntity() {
         Instant now = Instant.now();
-        AuditRecord record = new AuditRecord("evt-1", "cam-001", "CAMERA", "MOTION_DETECTED",
-            "Camera cam-001 reported MOTION_DETECTED", now, now);
+        AuditRecord record = new AuditRecord("evt-1", "DEVICE-00014", "PROPERTY_CHANGE", "iotProperty",
+            "Device DEVICE-00014 reported a property change", now, now);
 
-        AuditJpaEntity entity = AuditMapper.toEntity(record);
-        AuditRecord roundTripped = AuditMapper.toDomain(entity);
+        AuditRecord roundTripped = AuditMapper.toDomain(AuditMapper.toEntity(record));
 
         assertThat(roundTripped).isEqualTo(record);
     }
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it fails**
+- [ ] **Step 4: Run, verify fails** — `mvn -q test -Dtest=AuditMapperTest`
 
-Run: `mvn -q test -Dtest=AuditMapperTest`
-Expected: FAIL — `AuditJpaEntity` and `AuditMapper` do not exist yet.
-
-- [ ] **Step 5: Write `AuditJpaEntity`**
+- [ ] **Step 5: `AuditJpaEntity`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.persistence;
@@ -2431,8 +2057,8 @@ public class AuditJpaEntity {
     @Column(name = "device_id", nullable = false)
     private String deviceId;
 
-    @Column(name = "device_type", nullable = false)
-    private String deviceType;
+    @Column(name = "event_category", nullable = false)
+    private String eventCategory;
 
     @Column(name = "event_type", nullable = false)
     private String eventType;
@@ -2449,11 +2075,11 @@ public class AuditJpaEntity {
     protected AuditJpaEntity() {
     }
 
-    public AuditJpaEntity(String eventId, String deviceId, String deviceType, String eventType,
+    public AuditJpaEntity(String eventId, String deviceId, String eventCategory, String eventType,
                            String generalInfo, Instant consumedAt, Instant createdAt) {
         this.eventId = eventId;
         this.deviceId = deviceId;
-        this.deviceType = deviceType;
+        this.eventCategory = eventCategory;
         this.eventType = eventType;
         this.generalInfo = generalInfo;
         this.consumedAt = consumedAt;
@@ -2472,8 +2098,8 @@ public class AuditJpaEntity {
         return deviceId;
     }
 
-    public String getDeviceType() {
-        return deviceType;
+    public String getEventCategory() {
+        return eventCategory;
     }
 
     public String getEventType() {
@@ -2494,7 +2120,7 @@ public class AuditJpaEntity {
 }
 ```
 
-- [ ] **Step 6: Write `AuditMapper`**
+- [ ] **Step 6: `AuditMapper`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.persistence;
@@ -2507,23 +2133,20 @@ public final class AuditMapper {
     }
 
     public static AuditJpaEntity toEntity(AuditRecord record) {
-        return new AuditJpaEntity(record.dedupKey(), record.deviceId(), record.deviceType(), record.eventType(),
+        return new AuditJpaEntity(record.dedupKey(), record.deviceId(), record.eventCategory(), record.eventType(),
             record.generalInfo(), record.consumedAt(), record.createdAt());
     }
 
     public static AuditRecord toDomain(AuditJpaEntity entity) {
-        return new AuditRecord(entity.getEventId(), entity.getDeviceId(), entity.getDeviceType(),
+        return new AuditRecord(entity.getEventId(), entity.getDeviceId(), entity.getEventCategory(),
             entity.getEventType(), entity.getGeneralInfo(), entity.getConsumedAt(), entity.getCreatedAt());
     }
 }
 ```
 
-- [ ] **Step 7: Run the test to verify it passes**
+- [ ] **Step 7: Run, verify passes** — `mvn -q test -Dtest=AuditMapperTest` → 1 passed
 
-Run: `mvn -q test -Dtest=AuditMapperTest`
-Expected: `Tests run: 1, Failures: 0, Errors: 0`
-
-- [ ] **Step 8: Write `AuditJpaRepository` and `JpaAuditRepositoryAdapter`** (verified by the Task 14 integration test, not in isolation — per CLAUDE.md's testing strategy, repository adapters are proven through the full flow, not mocked)
+- [ ] **Step 8: `AuditJpaRepository` and `JpaAuditRepositoryAdapter`** (proven through Task 15's integration test, not in isolation)
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.persistence;
@@ -2586,48 +2209,21 @@ public class JpaAuditRepositoryAdapter implements AuditRepositoryPort {
 }
 ```
 
-- [ ] **Step 9: Verify the project compiles**
-
-Run: `mvn -q -DskipTests compile`
-Expected: `BUILD SUCCESS`
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add src/main/resources/db/migration src/main/java/com/intelbras/iotevents/domains/audit/adapters/persistence src/test/java/com/intelbras/iotevents/domains/audit/adapters/persistence
-git commit -m "feat: add Postgres audit persistence adapter"
-```
-
-- [ ] **Step 11: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/audit-persistence-adapter
-git branch -d feat/audit-persistence-adapter
-```
+- [ ] **Step 9: Verify compile** — `mvn -q -DskipTests compile`
+- [ ] **Step 10: Commit** — `git add src/main/resources/db/migration src/main/java/com/intelbras/iotevents/domains/audit/adapters/persistence src/test/java/com/intelbras/iotevents/domains/audit/adapters/persistence && git commit -m "feat: add Postgres audit persistence adapter"`
+- [ ] **Step 11: Merge** — `git checkout main && git merge --no-ff feat/audit-persistence-adapter && git branch -d feat/audit-persistence-adapter`
 
 ---
 
 ### Task 12: Kafka error handling + DLQ recoverer
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka/DeviceEventDlqRecoverer.java`
-- Create: `src/main/java/com/intelbras/iotevents/config/KafkaErrorHandlingConfig.java`
-- Modify: `src/main/resources/application.yml`
-- Test: `src/test/java/com/intelbras/iotevents/domains/audit/adapters/kafka/DeviceEventDlqRecovererTest.java`
+**Files:** Create `domains/audit/adapters/kafka/DeviceEventDlqRecoverer.java`, `config/KafkaErrorHandlingConfig.java`; Test `DeviceEventDlqRecovererTest.java`.
 
-**Interfaces:**
-- Consumes: `EventMetrics` (Task 10), `KafkaTopics` (Task 6).
-- Produces: `DeviceEventDlqRecoverer.recover(ConsumerRecord<?,?>, Exception, DeadLetterPublishingRecoverer): void`; a `CommonErrorHandler` bean that Spring Boot auto-applies to every `@KafkaListener` container (Task 13 listeners rely on this being in place for retry/DLQ to work).
+**Interfaces:** `DeviceEventDlqRecoverer.recover(ConsumerRecord<?,?>, Exception, DeadLetterPublishingRecoverer)`; a `CommonErrorHandler` bean auto-applied to every `@KafkaListener` container.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/kafka-dlq-recoverer`
 
-```bash
-git checkout main
-git checkout -b feat/kafka-dlq-recoverer
-```
-
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 2: Failing test**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.kafka;
@@ -2645,9 +2241,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.doThrow;
 
 class DeviceEventDlqRecovererTest {
 
@@ -2669,10 +2265,9 @@ class DeviceEventDlqRecovererTest {
 
     @Test
     void shouldDelegateToDeadLetterRecovererAndLogExactlyOnce() {
-        EventMetrics eventMetrics = new EventMetrics(new SimpleMeterRegistry());
-        DeviceEventDlqRecoverer recoverer = new DeviceEventDlqRecoverer(eventMetrics);
+        DeviceEventDlqRecoverer recoverer = new DeviceEventDlqRecoverer(new EventMetrics(new SimpleMeterRegistry()));
         DeadLetterPublishingRecoverer delegate = mock(DeadLetterPublishingRecoverer.class);
-        ConsumerRecord<String, String> record = new ConsumerRecord<>("device.alarm.events", 0, 1L, "alarm-001", "{}");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>("device.status-change.events", 0, 1L, "DEVICE-1", "{}");
         RuntimeException exception = new RuntimeException("boom");
 
         recoverer.recover(record, exception, delegate);
@@ -2683,10 +2278,9 @@ class DeviceEventDlqRecovererTest {
 
     @Test
     void shouldLogExactlyOnceEvenWhenDelegateThrows() {
-        EventMetrics eventMetrics = new EventMetrics(new SimpleMeterRegistry());
-        DeviceEventDlqRecoverer recoverer = new DeviceEventDlqRecoverer(eventMetrics);
+        DeviceEventDlqRecoverer recoverer = new DeviceEventDlqRecoverer(new EventMetrics(new SimpleMeterRegistry()));
         DeadLetterPublishingRecoverer delegate = mock(DeadLetterPublishingRecoverer.class);
-        ConsumerRecord<String, String> record = new ConsumerRecord<>("device.alarm.events", 0, 1L, "alarm-001", "{}");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>("device.status-change.events", 0, 1L, "DEVICE-1", "{}");
         RuntimeException exception = new RuntimeException("boom");
         doThrow(new IllegalStateException("delegate failed")).when(delegate).accept(record, exception);
 
@@ -2701,12 +2295,9 @@ class DeviceEventDlqRecovererTest {
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [ ] **Step 3: Run, verify fails** — `mvn -q test -Dtest=DeviceEventDlqRecovererTest`
 
-Run: `mvn -q test -Dtest=DeviceEventDlqRecovererTest`
-Expected: FAIL — `DeviceEventDlqRecoverer` does not exist yet.
-
-- [ ] **Step 4: Write `DeviceEventDlqRecoverer`**
+- [ ] **Step 4: `DeviceEventDlqRecoverer`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.kafka;
@@ -2748,12 +2339,9 @@ public class DeviceEventDlqRecoverer {
 }
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [ ] **Step 5: Run, verify passes** — `mvn -q test -Dtest=DeviceEventDlqRecovererTest` → 2 passed
 
-Run: `mvn -q test -Dtest=DeviceEventDlqRecovererTest`
-Expected: `Tests run: 2, Failures: 0, Errors: 0`
-
-- [ ] **Step 6: Write `KafkaErrorHandlingConfig`**
+- [ ] **Step 6: `KafkaErrorHandlingConfig`**
 
 ```java
 package com.intelbras.iotevents.config;
@@ -2778,8 +2366,7 @@ public class KafkaErrorHandlingConfig {
         DeadLetterPublishingRecoverer deadLetterRecoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
             (record, ex) -> new TopicPartition(record.topic() + KafkaTopics.DLT_SUFFIX, 0));
 
-        ConsumerRecordRecoverer recoverer = (record, ex) ->
-            dlqRecoverer.recover(record, ex, deadLetterRecoverer);
+        ConsumerRecordRecoverer recoverer = (record, ex) -> dlqRecoverer.recover(record, ex, deadLetterRecoverer);
 
         ExponentialBackOff backOff = new ExponentialBackOff(1000L, 2.0);
         backOff.setMaxAttempts(3);
@@ -2789,52 +2376,21 @@ public class KafkaErrorHandlingConfig {
 }
 ```
 
-- [ ] **Step 7: Verify the project compiles**
-
-Run: `mvn -q -DskipTests compile`
-Expected: `BUILD SUCCESS`
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka/DeviceEventDlqRecoverer.java src/main/java/com/intelbras/iotevents/config/KafkaErrorHandlingConfig.java src/test/java/com/intelbras/iotevents/domains/audit/adapters/kafka
-git commit -m "feat: add Kafka retry and dead-letter error handling"
-```
-
-- [ ] **Step 9: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/kafka-dlq-recoverer
-git branch -d feat/kafka-dlq-recoverer
-```
+- [ ] **Step 7: Verify compile** — `mvn -q -DskipTests compile`
+- [ ] **Step 8: Commit** — `git add src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka/DeviceEventDlqRecoverer.java src/main/java/com/intelbras/iotevents/config/KafkaErrorHandlingConfig.java src/test/java/com/intelbras/iotevents/domains/audit/adapters/kafka && git commit -m "feat: add Kafka retry and dead-letter error handling"`
+- [ ] **Step 9: Merge** — `git checkout main && git merge --no-ff feat/kafka-dlq-recoverer && git branch -d feat/kafka-dlq-recoverer`
 
 ---
 
 ### Task 13: Audit Kafka consumer listeners
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka/DeviceEventMessageParser.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka/listener/CameraEventListener.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka/listener/SensorEventListener.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka/listener/AlarmEventListener.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka/listener/GenericEventListener.java`
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/AuditUseCaseConfig.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/audit/adapters/kafka/DeviceEventMessageParserTest.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/audit/adapters/kafka/listener/CameraEventListenerTest.java`
+**Files:** Create `domains/audit/adapters/kafka/DeviceEventMessageParser.java`, `domains/audit/adapters/kafka/listener/{PropertyChangeEventListener,StatusChangeEventListener,MotionDetectionEventListener,OtherEventListener}.java`, `domains/audit/AuditUseCaseConfig.java`; Test parser + one listener.
 
-**Interfaces:**
-- Consumes: `RecordDeviceEventAuditUseCase` (Task 10), `IncomingDeviceEvent`/`KafkaMessageContext` (Task 8), `KafkaTopics` (Task 6).
-- Produces: four `@KafkaListener`-annotated classes wired to the consumer group `audit-service`, each parsing the wire JSON and calling `RecordDeviceEventAuditUseCase.execute(...)`.
+**Interfaces:** Four `@KafkaListener`s wired to `audit-service`, each parsing the wire JSON (`eventCategory` key, not `deviceType`) and calling `RecordDeviceEventAuditUseCase.execute(...)`.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/audit-kafka-listeners`
 
-```bash
-git checkout main
-git checkout -b feat/audit-kafka-listeners
-```
-
-- [ ] **Step 2: Write the failing parser test**
+- [ ] **Step 2: Failing parser test**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.kafka;
@@ -2852,34 +2408,31 @@ class DeviceEventMessageParserTest {
     @Test
     void shouldParseTheWireJsonIntoAnIncomingDeviceEvent() {
         String json = """
-            {"eventId":"evt-1","deviceId":"cam-001","deviceType":"CAMERA","eventType":"MOTION_DETECTED",
-             "timestamp":"2026-01-10T10:00:00Z","payload":{"confidence":0.9}}
+            {"eventId":"evt-1","deviceId":"DEVICE-00014","eventCategory":"PROPERTY_CHANGE","eventType":"iotProperty",
+             "timestamp":"2026-09-25T08:47:51.157000Z","payload":{"properties":{"11800":3}}}
             """;
 
         IncomingDeviceEvent event = parser.parse(json);
 
         assertThat(event.eventId()).isEqualTo("evt-1");
-        assertThat(event.deviceId()).isEqualTo("cam-001");
-        assertThat(event.deviceType()).isEqualTo("CAMERA");
-        assertThat(event.eventType()).isEqualTo("MOTION_DETECTED");
-        assertThat(event.payload()).containsEntry("confidence", 0.9);
+        assertThat(event.deviceId()).isEqualTo("DEVICE-00014");
+        assertThat(event.eventCategory()).isEqualTo("PROPERTY_CHANGE");
+        assertThat(event.eventType()).isEqualTo("iotProperty");
     }
 
     @Test
     void shouldDefaultToEmptyPayloadWhenMissing() {
         String json = """
-            {"eventId":"evt-2","deviceId":"alarm-001","deviceType":"ALARM","eventType":"STATUS_CHANGE",
-             "timestamp":"2026-01-10T10:00:00Z"}
+            {"eventId":"evt-2","deviceId":"DEVICE-00056","eventCategory":"STATUS_CHANGE","eventType":"online",
+             "timestamp":"2026-09-25T09:55:59Z"}
             """;
 
-        IncomingDeviceEvent event = parser.parse(json);
-
-        assertThat(event.payload()).isEmpty();
+        assertThat(parser.parse(json).payload()).isEmpty();
     }
 }
 ```
 
-- [ ] **Step 3: Write the failing listener test**
+- [ ] **Step 3: Failing listener test**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.kafka.listener;
@@ -2899,35 +2452,27 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-class CameraEventListenerTest {
+class PropertyChangeEventListenerTest {
 
     @Test
     void shouldParseTheRecordAndCallTheUseCaseWithKafkaContext() {
         DeviceEventMessageParser parser = mock(DeviceEventMessageParser.class);
         RecordDeviceEventAuditUseCase useCase = mock(RecordDeviceEventAuditUseCase.class);
-        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "cam-001", "CAMERA", "MOTION_DETECTED",
-            Instant.parse("2026-01-10T10:00:00Z"), Map.of());
-        ConsumerRecord<String, String> record = new ConsumerRecord<>("device.camera.events", 2, 42L, "cam-001", "{}");
+        IncomingDeviceEvent event = new IncomingDeviceEvent("evt-1", "DEVICE-00014", "PROPERTY_CHANGE", "iotProperty",
+            Instant.parse("2026-09-25T08:47:51.157000Z"), Map.of());
+        ConsumerRecord<String, String> record = new ConsumerRecord<>("device.property-change.events", 2, 42L, "DEVICE-00014", "{}");
         when(parser.parse("{}")).thenReturn(event);
 
-        CameraEventListener listener = new CameraEventListener(parser, useCase);
-        listener.onMessage(record);
+        new PropertyChangeEventListener(parser, useCase).onMessage(record);
 
-        verify(useCase).execute(eq(event), eq(new KafkaMessageContext("device.camera.events", 2, 42L, "cam-001")));
+        verify(useCase).execute(eq(event), eq(new KafkaMessageContext("device.property-change.events", 2, 42L, "DEVICE-00014")));
     }
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they fail**
+- [ ] **Step 4: Run, verify both fail** — `mvn -q test -Dtest=DeviceEventMessageParserTest,PropertyChangeEventListenerTest`
 
-Run: `mvn -q test -Dtest=DeviceEventMessageParserTest,CameraEventListenerTest`
-Expected: FAIL — `DeviceEventMessageParser` and `CameraEventListener` do not exist yet.
-
-- [ ] **Step 5: Add an `equals`/`hashCode`-friendly `KafkaMessageContext` check**
-
-`KafkaMessageContext` is already a `record` (Task 8), so structural equality is free — no change needed here; confirming it in this step for the listener test above to pass.
-
-- [ ] **Step 6: Write `DeviceEventMessageParser`**
+- [ ] **Step 5: `DeviceEventMessageParser`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.kafka;
@@ -2955,12 +2500,12 @@ public class DeviceEventMessageParser {
             });
             String eventId = (String) raw.get("eventId");
             String deviceId = (String) raw.get("deviceId");
-            String deviceType = (String) raw.get("deviceType");
+            String eventCategory = (String) raw.get("eventCategory");
             String eventType = (String) raw.get("eventType");
             Instant timestamp = Instant.parse((String) raw.get("timestamp"));
             @SuppressWarnings("unchecked")
             Map<String, Object> payload = (Map<String, Object>) raw.getOrDefault("payload", Map.of());
-            return new IncomingDeviceEvent(eventId, deviceId, deviceType, eventType, timestamp, payload);
+            return new IncomingDeviceEvent(eventId, deviceId, eventCategory, eventType, timestamp, payload);
         } catch (Exception ex) {
             throw new IllegalArgumentException("Failed to parse device event message: " + json, ex);
         }
@@ -2968,7 +2513,7 @@ public class DeviceEventMessageParser {
 }
 ```
 
-- [ ] **Step 7: Write the four listeners**
+- [ ] **Step 6: The four listeners**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.kafka.listener;
@@ -2983,21 +2528,20 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 @Component
-public class CameraEventListener {
+public class PropertyChangeEventListener {
 
     private final DeviceEventMessageParser parser;
     private final RecordDeviceEventAuditUseCase useCase;
 
-    public CameraEventListener(DeviceEventMessageParser parser, RecordDeviceEventAuditUseCase useCase) {
+    public PropertyChangeEventListener(DeviceEventMessageParser parser, RecordDeviceEventAuditUseCase useCase) {
         this.parser = parser;
         this.useCase = useCase;
     }
 
-    @KafkaListener(topics = KafkaTopics.DEVICE_CAMERA_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "3")
+    @KafkaListener(topics = KafkaTopics.DEVICE_PROPERTY_CHANGE_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "3")
     public void onMessage(ConsumerRecord<String, String> record) {
         IncomingDeviceEvent event = parser.parse(record.value());
-        KafkaMessageContext context = new KafkaMessageContext(record.topic(), record.partition(), record.offset(), record.key());
-        useCase.execute(event, context);
+        useCase.execute(event, new KafkaMessageContext(record.topic(), record.partition(), record.offset(), record.key()));
     }
 }
 ```
@@ -3015,21 +2559,20 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 @Component
-public class SensorEventListener {
+public class StatusChangeEventListener {
 
     private final DeviceEventMessageParser parser;
     private final RecordDeviceEventAuditUseCase useCase;
 
-    public SensorEventListener(DeviceEventMessageParser parser, RecordDeviceEventAuditUseCase useCase) {
+    public StatusChangeEventListener(DeviceEventMessageParser parser, RecordDeviceEventAuditUseCase useCase) {
         this.parser = parser;
         this.useCase = useCase;
     }
 
-    @KafkaListener(topics = KafkaTopics.DEVICE_SENSOR_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "3")
+    @KafkaListener(topics = KafkaTopics.DEVICE_STATUS_CHANGE_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "3")
     public void onMessage(ConsumerRecord<String, String> record) {
         IncomingDeviceEvent event = parser.parse(record.value());
-        KafkaMessageContext context = new KafkaMessageContext(record.topic(), record.partition(), record.offset(), record.key());
-        useCase.execute(event, context);
+        useCase.execute(event, new KafkaMessageContext(record.topic(), record.partition(), record.offset(), record.key()));
     }
 }
 ```
@@ -3047,21 +2590,20 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 @Component
-public class AlarmEventListener {
+public class MotionDetectionEventListener {
 
     private final DeviceEventMessageParser parser;
     private final RecordDeviceEventAuditUseCase useCase;
 
-    public AlarmEventListener(DeviceEventMessageParser parser, RecordDeviceEventAuditUseCase useCase) {
+    public MotionDetectionEventListener(DeviceEventMessageParser parser, RecordDeviceEventAuditUseCase useCase) {
         this.parser = parser;
         this.useCase = useCase;
     }
 
-    @KafkaListener(topics = KafkaTopics.DEVICE_ALARM_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "3")
+    @KafkaListener(topics = KafkaTopics.DEVICE_MOTION_DETECTION_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "3")
     public void onMessage(ConsumerRecord<String, String> record) {
         IncomingDeviceEvent event = parser.parse(record.value());
-        KafkaMessageContext context = new KafkaMessageContext(record.topic(), record.partition(), record.offset(), record.key());
-        useCase.execute(event, context);
+        useCase.execute(event, new KafkaMessageContext(record.topic(), record.partition(), record.offset(), record.key()));
     }
 }
 ```
@@ -3079,33 +2621,32 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 @Component
-public class GenericEventListener {
+public class OtherEventListener {
 
     private final DeviceEventMessageParser parser;
     private final RecordDeviceEventAuditUseCase useCase;
 
-    public GenericEventListener(DeviceEventMessageParser parser, RecordDeviceEventAuditUseCase useCase) {
+    public OtherEventListener(DeviceEventMessageParser parser, RecordDeviceEventAuditUseCase useCase) {
         this.parser = parser;
         this.useCase = useCase;
     }
 
-    @KafkaListener(topics = KafkaTopics.DEVICE_GENERIC_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "3")
+    @KafkaListener(topics = KafkaTopics.DEVICE_OTHER_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "3")
     public void onMessage(ConsumerRecord<String, String> record) {
         IncomingDeviceEvent event = parser.parse(record.value());
-        KafkaMessageContext context = new KafkaMessageContext(record.topic(), record.partition(), record.offset(), record.key());
-        useCase.execute(event, context);
+        useCase.execute(event, new KafkaMessageContext(record.topic(), record.partition(), record.offset(), record.key()));
     }
 }
 ```
 
-- [ ] **Step 8: Register the audit use cases as Spring beans**
+- [ ] **Step 7: Register the audit use case beans**
 
 ```java
 package com.intelbras.iotevents.domains.audit;
 
 import com.intelbras.iotevents.common.metrics.EventMetrics;
 import com.intelbras.iotevents.domains.audit.core.handler.DeviceEventAuditHandler;
-import com.intelbras.iotevents.domains.audit.core.handler.GenericEventAuditHandler;
+import com.intelbras.iotevents.domains.audit.core.handler.OtherEventAuditHandler;
 import com.intelbras.iotevents.domains.audit.core.port.AuditRepositoryPort;
 import com.intelbras.iotevents.domains.audit.core.usecase.QueryAuditsUseCase;
 import com.intelbras.iotevents.domains.audit.core.usecase.RecordDeviceEventAuditUseCase;
@@ -3120,7 +2661,7 @@ public class AuditUseCaseConfig {
     @Bean
     public RecordDeviceEventAuditUseCase recordDeviceEventAuditUseCase(AuditRepositoryPort auditRepositoryPort,
                                                                          List<DeviceEventAuditHandler> handlers,
-                                                                         GenericEventAuditHandler fallbackHandler,
+                                                                         OtherEventAuditHandler fallbackHandler,
                                                                          EventMetrics eventMetrics) {
         return new RecordDeviceEventAuditUseCase(auditRepositoryPort, handlers, fallbackHandler, eventMetrics);
     }
@@ -3132,46 +2673,19 @@ public class AuditUseCaseConfig {
 }
 ```
 
-- [ ] **Step 9: Run the tests to verify they pass**
-
-Run: `mvn -q test -Dtest=DeviceEventMessageParserTest,CameraEventListenerTest`
-Expected: `Tests run: 3, Failures: 0, Errors: 0`
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka src/main/java/com/intelbras/iotevents/domains/audit/AuditUseCaseConfig.java src/test/java/com/intelbras/iotevents/domains/audit/adapters/kafka
-git commit -m "feat: add audit Kafka consumer listeners"
-```
-
-- [ ] **Step 11: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/audit-kafka-listeners
-git branch -d feat/audit-kafka-listeners
-```
+- [ ] **Step 8: Run, verify passes** — `mvn -q test -Dtest=DeviceEventMessageParserTest,PropertyChangeEventListenerTest` → 3 passed
+- [ ] **Step 9: Commit** — `git add src/main/java/com/intelbras/iotevents/domains/audit/adapters/kafka src/main/java/com/intelbras/iotevents/domains/audit/AuditUseCaseConfig.java src/test/java/com/intelbras/iotevents/domains/audit/adapters/kafka && git commit -m "feat: add audit Kafka consumer listeners"`
+- [ ] **Step 10: Merge** — `git checkout main && git merge --no-ff feat/audit-kafka-listeners && git branch -d feat/audit-kafka-listeners`
 
 ---
 
 ### Task 14: Audit REST query endpoint
 
-**Files:**
-- Create: `src/main/java/com/intelbras/iotevents/domains/audit/adapters/web/AuditController.java`
-- Test: `src/test/java/com/intelbras/iotevents/domains/audit/adapters/web/AuditControllerTest.java`
+**Files:** Create `domains/audit/adapters/web/AuditController.java`; Test `AuditControllerTest.java`.
 
-**Interfaces:**
-- Consumes: `QueryAuditsUseCase`, `AuditQueryFilter`, `AuditRecord` (Tasks 8, 10).
-- Produces: `GET /audits?deviceId=&eventType=&from=&to=` returning a JSON array of `AuditRecord`.
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b feat/audit-controller`
 
-- [ ] **Step 1: Create the task branch**
-
-```bash
-git checkout main
-git checkout -b feat/audit-controller
-```
-
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 2: Failing test**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.web;
@@ -3204,26 +2718,22 @@ class AuditControllerTest {
 
     @Test
     void shouldReturnAuditsMatchingTheGivenFilter() throws Exception {
-        AuditRecord record = new AuditRecord("evt-1", "cam-001", "CAMERA", "MOTION_DETECTED",
-            "Camera cam-001 reported MOTION_DETECTED", Instant.parse("2026-01-10T10:00:00Z"),
-            Instant.parse("2026-01-10T10:00:00Z"));
-        when(queryAuditsUseCase.execute(new AuditQueryFilter("cam-001", null, null, null)))
-            .thenReturn(List.of(record));
+        AuditRecord record = new AuditRecord("evt-1", "DEVICE-00014", "PROPERTY_CHANGE", "iotProperty",
+            "Device DEVICE-00014 reported a property change", Instant.parse("2026-09-25T08:47:51.157000Z"),
+            Instant.parse("2026-09-25T08:47:51.157000Z"));
+        when(queryAuditsUseCase.execute(new AuditQueryFilter("DEVICE-00014", null, null, null))).thenReturn(List.of(record));
 
-        mockMvc.perform(get("/audits").param("deviceId", "cam-001"))
+        mockMvc.perform(get("/audits").param("deviceId", "DEVICE-00014"))
             .andExpect(status().isOk())
-            .andExpect(jsonPath("$[0].deviceId").value("cam-001"))
-            .andExpect(jsonPath("$[0].generalInfo").value("Camera cam-001 reported MOTION_DETECTED"));
+            .andExpect(jsonPath("$[0].deviceId").value("DEVICE-00014"))
+            .andExpect(jsonPath("$[0].eventCategory").value("PROPERTY_CHANGE"));
     }
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [ ] **Step 3: Run, verify fails** — `mvn -q test -Dtest=AuditControllerTest`
 
-Run: `mvn -q test -Dtest=AuditControllerTest`
-Expected: FAIL — `AuditController` does not exist yet.
-
-- [ ] **Step 4: Write `AuditController`**
+- [ ] **Step 4: `AuditController`**
 
 ```java
 package com.intelbras.iotevents.domains.audit.adapters.web;
@@ -3261,46 +2771,21 @@ public class AuditController {
 }
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
-
-Run: `mvn -q test -Dtest=AuditControllerTest`
-Expected: `Tests run: 1, Failures: 0, Errors: 0`
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/main/java/com/intelbras/iotevents/domains/audit/adapters/web src/test/java/com/intelbras/iotevents/domains/audit/adapters/web
-git commit -m "feat: add audit query REST endpoint"
-```
-
-- [ ] **Step 7: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff feat/audit-controller
-git branch -d feat/audit-controller
-```
+- [ ] **Step 5: Run, verify passes** — `mvn -q test -Dtest=AuditControllerTest` → 1 passed
+- [ ] **Step 6: Commit** — `git add src/main/java/com/intelbras/iotevents/domains/audit/adapters/web src/test/java/com/intelbras/iotevents/domains/audit/adapters/web && git commit -m "feat: add audit query REST endpoint"`
+- [ ] **Step 7: Merge** — `git checkout main && git merge --no-ff feat/audit-controller && git branch -d feat/audit-controller`
 
 ---
 
 ### Task 15: End-to-end Testcontainers integration tests
 
-**Files:**
-- Create: `src/test/java/com/intelbras/iotevents/AuditFlowIT.java`
-- Create: `src/test/resources/application-test.yml`
+**Files:** Create `src/test/java/com/intelbras/iotevents/AuditFlowIT.java`, `src/test/resources/application-test.yml`.
 
-**Interfaces:**
-- Consumes: the full running application (all prior tasks) against real Kafka + Postgres containers.
-- Produces: proof that the happy path, duplicate path, and forced-failure/DLQ path all work end-to-end, satisfying RT05/RT06 and the Kafka-integration-test bonus.
+**Interfaces:** Proves the happy path (100 real rows → 100 audits), duplicate path (re-ingest → no growth), and failure path (4 synthetic rows → 4 DLT messages, zero audits) against real Kafka + Postgres containers.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b test/audit-flow-integration-tests`
 
-```bash
-git checkout main
-git checkout -b test/audit-flow-integration-tests
-```
-
-- [ ] **Step 2: Write `src/test/resources/application-test.yml`** (keeps the test profile from trying to run Flyway against a fixed host before Testcontainers assigns ports — properties are overridden dynamically in the test class instead)
+- [ ] **Step 2: `src/test/resources/application-test.yml`**
 
 ```yaml
 spring:
@@ -3311,20 +2796,18 @@ spring:
     enabled: true
 ```
 
-- [ ] **Step 3: Write the failing integration test**
+- [ ] **Step 3: Failing integration test**
 
 ```java
 package com.intelbras.iotevents;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.intelbras.iotevents.config.KafkaTopics;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -3341,6 +2824,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -3358,9 +2842,7 @@ class AuditFlowIT {
 
     @Container
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(DockerImageName.parse("postgres:16-alpine"))
-        .withDatabaseName("iotevents")
-        .withUsername("iotevents")
-        .withPassword("iotevents");
+        .withDatabaseName("iotevents").withUsername("iotevents").withPassword("iotevents");
 
     @DynamicPropertySource
     static void registerProperties(DynamicPropertyRegistry registry) {
@@ -3373,48 +2855,42 @@ class AuditFlowIT {
     @LocalServerPort
     private int port;
 
-    private TestRestTemplate restTemplate = new TestRestTemplate();
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final TestRestTemplate restTemplate = new TestRestTemplate();
 
     @Test
-    void shouldProcessAllEventsFromTheSampleCsvAndExposeThemViaAudits() {
-        ResponseEntity<Map> response = restTemplate.postForEntity(
-            "http://localhost:" + port + "/events/simulate", null, Map.class);
+    void shouldProcessAllRealRowsAndDeadLetterTheFourSyntheticOnes() {
+        ResponseEntity<Map> response = restTemplate.postForEntity("http://localhost:" + port + "/events/simulate", null, Map.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(response.getBody().get("publishedCount")).isEqualTo(12);
+        assertThat(response.getBody().get("publishedCount")).isEqualTo(104);
 
-        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
-            ResponseEntity<List> audits = restTemplate.getForEntity(
-                "http://localhost:" + port + "/audits?deviceId=cam-001", List.class);
-            assertThat(audits.getBody()).hasSize(2);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            ResponseEntity<List> audits = restTemplate.getForEntity("http://localhost:" + port + "/audits", List.class);
+            assertThat(audits.getBody()).hasSize(100);
         });
+
+        for (String topic : KafkaTopics.allTopics()) {
+            List<ConsumerRecord<String, String>> dltRecords = consumeFromDlt(topic + KafkaTopics.DLT_SUFFIX);
+            assertThat(dltRecords).hasSize(1);
+            assertThat(dltRecords.get(0).key()).startsWith("SYNTHETIC-DLQ-");
+        }
     }
 
     @Test
-    void shouldPersistOnlyOneAuditRowWhenTheSameEventIsIngestedTwice() {
-        restTemplate.postForEntity("http://localhost:" + port + "/events/simulate", null, Map.class);
-        restTemplate.postForEntity("http://localhost:" + port + "/events/simulate", null, Map.class);
-
-        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
-            ResponseEntity<List> audits = restTemplate.getForEntity(
-                "http://localhost:" + port + "/audits?deviceId=cam-001", List.class);
-            assertThat(audits.getBody()).hasSize(2);
-        });
-    }
-
-    @Test
-    void shouldDeadLetterTheForcedFailureEventWithoutPersistingAnAudit() {
+    void shouldNotGrowTheAuditTableWhenTheSameEventsAreIngestedTwice() {
         restTemplate.postForEntity("http://localhost:" + port + "/events/simulate", null, Map.class);
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-            List<ConsumerRecord<String, String>> dltRecords = consumeFromDlt("device.alarm.events.DLT");
-            assertThat(dltRecords).anySatisfy(record -> assertThat(record.key()).isEqualTo("alarm-001"));
+            ResponseEntity<List> audits = restTemplate.getForEntity("http://localhost:" + port + "/audits", List.class);
+            assertThat(audits.getBody()).hasSize(100);
         });
 
-        ResponseEntity<List> audits = restTemplate.getForEntity(
-            "http://localhost:" + port + "/audits?deviceId=alarm-001", List.class);
-        assertThat(audits.getBody()).hasSize(1);
+        restTemplate.postForEntity("http://localhost:" + port + "/events/simulate", null, Map.class);
+
+        await().pollDelay(Duration.ofSeconds(5)).atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            ResponseEntity<List> audits = restTemplate.getForEntity("http://localhost:" + port + "/audits", List.class);
+            assertThat(audits.getBody()).hasSize(100);
+        });
     }
 
     private List<ConsumerRecord<String, String>> consumeFromDlt(String topic) {
@@ -3427,67 +2903,34 @@ class AuditFlowIT {
 
         try (Consumer<String, String> consumer = new KafkaConsumer<>(props)) {
             consumer.subscribe(List.of(topic));
-            ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(5));
-            return records.records(topic);
+            List<ConsumerRecord<String, String>> collected = new ArrayList<>();
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (collected.isEmpty() && System.currentTimeMillis() < deadline) {
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(2));
+                records.records(topic).forEach(collected::add);
+            }
+            return collected;
         }
     }
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it fails (or does not compile) before Docker is available**
-
-Run: `mvn -q test -Dtest=AuditFlowIT`
-Expected: if Docker is not running locally, FAIL with a Testcontainers startup error — note this and move to Step 5 anyway, since the code must still be correct; re-run once Docker is confirmed available (see Step 6).
-
-- [ ] **Step 5: Confirm Docker is available**
-
-Run: `docker info`
-Expected: a running Docker daemon. If this fails, start Docker Desktop (or the local Docker service) before continuing — Testcontainers requires it.
-
-- [ ] **Step 6: Run the test to verify it passes with Docker available**
-
-Run: `mvn -q test -Dtest=AuditFlowIT`
-Expected: `Tests run: 3, Failures: 0, Errors: 0` (first run will be slower while Testcontainers pulls the Kafka and Postgres images).
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/test/java/com/intelbras/iotevents/AuditFlowIT.java src/test/resources/application-test.yml
-git commit -m "test: add end-to-end Testcontainers audit flow tests"
-```
-
-- [ ] **Step 8: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff test/audit-flow-integration-tests
-git branch -d test/audit-flow-integration-tests
-```
+- [ ] **Step 4: Confirm Docker is available** — `docker info` (start Docker if this fails; Testcontainers requires it)
+- [ ] **Step 5: Run, verify passes** — `mvn -q test -Dtest=AuditFlowIT` → 2 passed (first run slower while images are pulled)
+- [ ] **Step 6: Commit** — `git add src/test/java/com/intelbras/iotevents/AuditFlowIT.java src/test/resources/application-test.yml && git commit -m "test: add end-to-end Testcontainers audit flow tests"`
+- [ ] **Step 7: Merge** — `git checkout main && git merge --no-ff test/audit-flow-integration-tests && git branch -d test/audit-flow-integration-tests`
 
 ---
 
 ### Task 16: Observability — Prometheus + Grafana in Docker Compose
 
-**Files:**
-- Modify: `docker-compose.yml`
-- Create: `observability/prometheus.yml`
-- Create: `observability/grafana/provisioning/datasources/datasource.yml`
-- Create: `observability/grafana/provisioning/dashboards/dashboards.yml`
-- Create: `observability/grafana/dashboards/device-events-dashboard.json`
-- Create: `Dockerfile`
+**Files:** Modify `docker-compose.yml`; Create `observability/prometheus.yml`, `observability/grafana/provisioning/datasources/datasource.yml`, `observability/grafana/provisioning/dashboards/dashboards.yml`, `observability/grafana/dashboards/device-events-dashboard.json`, `Dockerfile`.
 
-**Interfaces:**
-- Consumes: `/actuator/prometheus` (auto-exposed by `spring-boot-starter-actuator` + `micrometer-registry-prometheus`, already on the classpath since Task 1).
-- Produces: a full local stack — `docker compose up` brings up Kafka, Postgres, the app, Prometheus, and Grafana with a pre-provisioned dashboard.
+Unaffected by the dataset pivot — metric names are category-agnostic. Identical to the original plan.
 
-- [ ] **Step 1: Create the task branch**
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b chore/observability-stack`
 
-```bash
-git checkout main
-git checkout -b chore/observability-stack
-```
-
-- [ ] **Step 2: Write `Dockerfile`**
+- [ ] **Step 2: `Dockerfile`**
 
 ```dockerfile
 FROM maven:3.9-eclipse-temurin-21 AS build
@@ -3503,12 +2946,11 @@ EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
 ```
 
-- [ ] **Step 3: Write `observability/prometheus.yml`**
+- [ ] **Step 3: `observability/prometheus.yml`**
 
 ```yaml
 global:
   scrape_interval: 5s
-
 scrape_configs:
   - job_name: "iot-events-app"
     metrics_path: /actuator/prometheus
@@ -3516,7 +2958,7 @@ scrape_configs:
       - targets: ["app:8080"]
 ```
 
-- [ ] **Step 4: Write Grafana provisioning files**
+- [ ] **Step 4: Grafana provisioning**
 
 ```yaml
 apiVersion: 1
@@ -3539,7 +2981,7 @@ providers:
       path: /etc/grafana/provisioning/dashboards-data
 ```
 
-- [ ] **Step 5: Write `observability/grafana/dashboards/device-events-dashboard.json`**
+- [ ] **Step 5: `observability/grafana/dashboards/device-events-dashboard.json`**
 
 ```json
 {
@@ -3547,57 +2989,26 @@ providers:
   "schemaVersion": 39,
   "version": 1,
   "panels": [
-    {
-      "id": 1,
-      "title": "Events Processed (rate)",
-      "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
-      "targets": [
-        {"expr": "rate(device_events_processed_total[1m])", "legendFormat": "processed"}
-      ]
-    },
-    {
-      "id": 2,
-      "title": "Duplicates Skipped (rate)",
-      "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
-      "targets": [
-        {"expr": "rate(device_events_duplicate_total[1m])", "legendFormat": "duplicates"}
-      ]
-    },
-    {
-      "id": 3,
-      "title": "Dead-lettered Events (rate)",
-      "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
-      "targets": [
-        {"expr": "rate(device_events_dlq_total[1m])", "legendFormat": "dlq"}
-      ]
-    },
-    {
-      "id": 4,
-      "title": "Kafka Consumer Lag",
-      "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
-      "targets": [
-        {"expr": "sum(kafka_consumer_fetch_manager_records_lag) by (topic)", "legendFormat": "{{topic}}"}
-      ]
-    }
+    {"id": 1, "title": "Events Processed (rate)", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+     "targets": [{"expr": "rate(device_events_processed_total[1m])", "legendFormat": "processed"}]},
+    {"id": 2, "title": "Duplicates Skipped (rate)", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+     "targets": [{"expr": "rate(device_events_duplicate_total[1m])", "legendFormat": "duplicates"}]},
+    {"id": 3, "title": "Dead-lettered Events (rate)", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+     "targets": [{"expr": "rate(device_events_dlq_total[1m])", "legendFormat": "dlq"}]},
+    {"id": 4, "title": "Kafka Consumer Lag", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+     "targets": [{"expr": "sum(kafka_consumer_fetch_manager_records_lag) by (topic)", "legendFormat": "{{topic}}"}]}
   ]
 }
 ```
 
-- [ ] **Step 6: Update `docker-compose.yml` to add `app`, `prometheus`, and `grafana`**
-
-Replace the full file content with:
+- [ ] **Step 6: Update `docker-compose.yml`** (full replacement, adding `app`, `prometheus`, `grafana`)
 
 ```yaml
 services:
   kafka:
     image: apache/kafka:3.8.0
     container_name: iotevents-kafka
-    ports:
-      - "9092:9092"
+    ports: ["9092:9092"]
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -3611,23 +3022,18 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: iotevents-postgres
-    ports:
-      - "5432:5432"
+    ports: ["5432:5432"]
     environment:
       POSTGRES_DB: iotevents
       POSTGRES_USER: iotevents
       POSTGRES_PASSWORD: iotevents
-    volumes:
-      - iotevents-postgres-data:/var/lib/postgresql/data
+    volumes: ["iotevents-postgres-data:/var/lib/postgresql/data"]
 
   app:
     build: .
     container_name: iotevents-app
-    depends_on:
-      - kafka
-      - postgres
-    ports:
-      - "8080:8080"
+    depends_on: [kafka, postgres]
+    ports: ["8080:8080"]
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       DB_HOST: postgres
@@ -3639,20 +3045,15 @@ services:
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: iotevents-prometheus
-    depends_on:
-      - app
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on: [app]
+    ports: ["9090:9090"]
+    volumes: ["./observability/prometheus.yml:/etc/prometheus/prometheus.yml"]
 
   grafana:
     image: grafana/grafana:11.2.0
     container_name: iotevents-grafana
-    depends_on:
-      - prometheus
-    ports:
-      - "3000:3000"
+    depends_on: [prometheus]
+    ports: ["3000:3000"]
     environment:
       GF_SECURITY_ADMIN_PASSWORD: admin
     volumes:
@@ -3664,54 +3065,27 @@ volumes:
   iotevents-postgres-data:
 ```
 
-- [ ] **Step 7: Run the full stack and verify manually**
-
-Run: `docker compose up -d --build`
-Expected: all five containers reach a running state (`docker compose ps` shows no restarting/exited containers).
-
-Run: `curl -s -X POST http://localhost:8080/events/simulate`
-Expected: `{"publishedCount":12}`
-
-Run: `curl -s http://localhost:8080/actuator/prometheus | grep device_events_processed_total`
-Expected: a line like `device_events_processed_total 11.0` (11, not 12 — `evt-010`'s simulated failure is dead-lettered, not processed).
-
-Open `http://localhost:3000` (Grafana, login `admin`/`admin`) and confirm the "IoT Device Events" dashboard shows data on all four panels.
-
-- [ ] **Step 8: Tear down**
-
-Run: `docker compose down`
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 7: Run and verify manually**
 
 ```bash
-git add docker-compose.yml observability Dockerfile
-git commit -m "chore: add Docker Compose observability stack with Prometheus and Grafana"
+docker compose up -d --build
+curl -s -X POST http://localhost:8080/events/simulate   # expect {"publishedCount":104}
+curl -s http://localhost:8080/actuator/prometheus | grep device_events_processed_total   # expect 100.0 after all 4 synthetic rows dead-letter
 ```
 
-- [ ] **Step 10: Merge back to main**
+Open `http://localhost:3000` (admin/admin) and confirm the "IoT Device Events" dashboard renders.
 
-```bash
-git checkout main
-git merge --no-ff chore/observability-stack
-git branch -d chore/observability-stack
-```
+- [ ] **Step 8: Tear down** — `docker compose down`
+- [ ] **Step 9: Commit** — `git add docker-compose.yml observability Dockerfile && git commit -m "chore: add Docker Compose observability stack with Prometheus and Grafana"`
+- [ ] **Step 10: Merge** — `git checkout main && git merge --no-ff chore/observability-stack && git branch -d chore/observability-stack`
 
 ---
 
 ### Task 17: README run instructions
 
-**Files:**
-- Modify: `README.md`
+**Files:** Modify `README.md`.
 
-**Interfaces:**
-- Produces: documentation only, no code interfaces.
-
-- [ ] **Step 1: Create the task branch**
-
-```bash
-git checkout main
-git checkout -b docs/readme-run-instructions
-```
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b docs/readme-run-instructions`
 
 - [ ] **Step 2: Rewrite `README.md`**
 
@@ -3719,9 +3093,16 @@ git checkout -b docs/readme-run-instructions
 # case_intelbras_kafka_java
 
 Backend case for the Intelbras Backend Sênior process: an IoT device event processing
-pipeline built with Java, Spring Boot, and Apache Kafka. Full architecture rationale is
-in `docs/superpowers/specs/2026-10-10-iot-device-event-kafka-design.md`; coding
+pipeline built with Java, Spring Boot, and Apache Kafka. Architecture rationale is in
+`docs/superpowers/specs/2026-10-10-iot-device-event-kafka-design.md`; coding
 conventions are in `CLAUDE.md`.
+
+## The dataset
+
+`src/main/resources/events.csv` is the real 100-event dataset provided with the case,
+with 4 appended synthetic rows (`SYNTHETIC-DLQ-001..004`) used only to demonstrate the
+retry/dead-letter path live — one per event category, clearly labeled, never mixed into
+the real data without being called out. See `DECISIONS.md` for why.
 
 ## Running locally (Docker Compose)
 
@@ -3729,29 +3110,28 @@ conventions are in `CLAUDE.md`.
 docker compose up -d --build
 ```
 
-This starts Kafka (KRaft mode), Postgres, the application, Prometheus, and Grafana.
+Starts Kafka (KRaft), Postgres, the app, Prometheus, and Grafana.
 
-Once all containers are up:
-
-1. Trigger ingestion of the sample CSV (`src/main/resources/events.csv`):
+1. Trigger ingestion:
 
    ```bash
    curl -X POST http://localhost:8080/events/simulate
    ```
 
-2. Query the resulting audit trail:
+   Returns `{"publishedCount":104}` — 100 real events + 4 synthetic DLQ-demo events.
+
+2. Query the audit trail (only successfully processed events appear — the 4 synthetic
+   rows are dead-lettered, never audited):
 
    ```bash
    curl http://localhost:8080/audits
-   curl "http://localhost:8080/audits?deviceId=cam-001"
+   curl "http://localhost:8080/audits?deviceId=DEVICE-00014"
    ```
 
 3. Metrics: `http://localhost:8080/actuator/prometheus`
-4. Grafana dashboard: `http://localhost:3000` (login `admin`/`admin`), "IoT Device Events" dashboard.
+4. Grafana: `http://localhost:3000` (admin/admin), "IoT Device Events" dashboard.
 
-Re-running step 1 demonstrates idempotency (no new audit rows for already-seen events).
-`evt-010` in the sample CSV carries a `simulateFailure` flag and demonstrates the
-retry → dead-letter-topic path; it never produces an audit row.
+Re-running step 1 demonstrates idempotency (the audit count stays at 100).
 
 ## Running tests
 
@@ -3759,9 +3139,8 @@ retry → dead-letter-topic path; it never produces an audit row.
 mvn test
 ```
 
-This includes unit tests (no infra required) and `AuditFlowIT`, an end-to-end
-Testcontainers integration test that spins up real Kafka and Postgres containers —
-requires a running Docker daemon.
+Includes unit tests and `AuditFlowIT`, a Testcontainers end-to-end test — requires a
+running Docker daemon.
 
 ## Tearing down
 
@@ -3770,40 +3149,18 @@ docker compose down -v
 ```
 ```
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add README.md
-git commit -m "docs: add run instructions"
-```
-
-- [ ] **Step 4: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff docs/readme-run-instructions
-git branch -d docs/readme-run-instructions
-```
+- [ ] **Step 3: Commit** — `git add README.md && git commit -m "docs: add run instructions"`
+- [ ] **Step 4: Merge** — `git checkout main && git merge --no-ff docs/readme-run-instructions && git branch -d docs/readme-run-instructions`
 
 ---
 
 ### Task 18: Bloco B & C deliverable documents
 
-**Files:**
-- Create: `ARCHITECTURE.md`
-- Create: `DECISIONS.md`
+**Files:** Create `ARCHITECTURE.md`, `DECISIONS.md`.
 
-**Interfaces:**
-- Produces: the case's required Bloco B (architecture diagram + production-scale write-up) and Bloco C (technical decisions + trade-offs) deliverables, derived from the already-approved design spec.
+- [ ] **Step 1: Branch** — `git checkout main && git checkout -b docs/bloco-b-c-deliverables`
 
-- [ ] **Step 1: Create the task branch**
-
-```bash
-git checkout main
-git checkout -b docs/bloco-b-c-deliverables
-```
-
-- [ ] **Step 2: Write `ARCHITECTURE.md`**
+- [ ] **Step 2: `ARCHITECTURE.md`**
 
 ```markdown
 # Architecture (Bloco B)
@@ -3812,16 +3169,16 @@ git checkout -b docs/bloco-b-c-deliverables
 
 \`\`\`mermaid
 flowchart LR
-    CSV[events.csv] -->|POST /events/simulate| SIM[SimulateIngestionUseCase]
-    SIM -->|publish, key=deviceId| T1[device.camera.events]
-    SIM -->|publish, key=deviceId| T2[device.sensor.events]
-    SIM -->|publish, key=deviceId| T3[device.alarm.events]
-    SIM -->|publish, key=deviceId| T4[device.generic.events]
+    CSV[events.csv: 100 real + 4 synthetic] -->|POST /events/simulate| SIM[SimulateIngestionUseCase]
+    SIM -->|publish, key=deviceId| T1[device.property-change.events]
+    SIM -->|publish, key=deviceId| T2[device.status-change.events]
+    SIM -->|publish, key=deviceId| T3[device.motion-detection.events]
+    SIM -->|publish, key=deviceId| T4[device.other.events]
 
-    T1 --> L1[CameraEventListener]
-    T2 --> L2[SensorEventListener]
-    T3 --> L3[AlarmEventListener]
-    T4 --> L4[GenericEventListener]
+    T1 --> L1[PropertyChangeEventListener]
+    T2 --> L2[StatusChangeEventListener]
+    T3 --> L3[MotionDetectionEventListener]
+    T4 --> L4[OtherEventListener]
 
     L1 --> UC[RecordDeviceEventAuditUseCase]
     L2 --> UC
@@ -3835,116 +3192,93 @@ flowchart LR
     DB --> API[GET /audits]
 \`\`\`
 
+## Classification: EventCategory from msgType
+
+The real dataset has no device-type column. Its `msgType` field (always present) is
+grouped into the four kinds of event the case brief itself names: `PROPERTY_CHANGE`
+(`iotProperty`), `STATUS_CHANGE` (`online`/`offline`), `MOTION_DETECTION`
+(`videoMotion`/`mobileDetect`/`human`/`smartVideoMotion`), `OTHER` (everything else,
+including any future unrecognized `msgType`).
+
 ## Scalability and Kafka partitioning strategy
 
-Each device type gets its own topic (`device.camera.events`, `device.sensor.events`,
-`device.alarm.events`, `device.generic.events`), partitioned by `deviceId`. At case
-scale (100 events) each topic runs 3 partitions; at millions-of-events/day scale,
-partition count would grow based on per-topic throughput and target consumer
-parallelism (rule of thumb: partitions >= peak consumers you want to run
-concurrently in the group). Topic-per-device-type lets each device domain's traffic
-scale independently — a camera-heavy deployment can repartition `device.camera.events`
-without touching the others.
+Each category gets its own topic, partitioned by `deviceId`, 3 partitions at case
+scale. At millions-of-events/day scale, partition count would grow per topic based on
+observed throughput and target consumer parallelism; `PROPERTY_CHANGE` (45% of this
+sample) would likely need more partitions than `OTHER` (10%).
 
 ## Consumer groups and parallelism
 
-All four listeners share one consumer group, `audit-service` — they are the same
-logical consuming application, just subscribed to different topics. Concurrency
-(3, matching partition count) lets each topic's partitions be consumed in parallel
-within the group. At higher scale, horizontally scaling the audit service (more
-application instances, same group id) increases the number of partitions each
-instance's listener threads can claim, up to the partition count ceiling.
+All four listeners share consumer group `audit-service` — one logical consuming
+application across four topics. Concurrency (3, matching partition count) parallelizes
+within each topic. Scaling horizontally means more `audit-service` instances, up to the
+partition-count ceiling per topic.
 
 ## Ordering
 
-Keying every record by `deviceId` guarantees Kafka delivers all of one device's
-events to the same partition, in produce order, and that partition is consumed by
-exactly one consumer thread at a time within the group — so one device's event
-history is processed in order. Different devices may be processed out of order
-relative to each other, by design, for parallelism.
+Keying every record by `deviceId` guarantees one device's events land on the same
+partition, consumed in order, by one consumer thread at a time. Different devices may
+interleave, by design, for parallelism.
 
 ## Idempotency and duplicate handling
 
-Every event carries an `eventId` (the CSV's own id, or a deterministic SHA-256 hash
-of `deviceId|eventType|timestamp|payload` when absent), computed once at the
-`device` domain and carried in the wire message. `audit` checks
-`existsByDedupKey(eventId)` before processing; a duplicate is logged and skipped,
-never reprocessed, never given a new audit row. The `event_id` column also carries
-a database-level unique constraint as a second line of defense against a race
-between the check and the insert.
+`eventId` is resolved once, in `device.core`: the dataset's own native id
+(`body_completo.id`, present on camera/alarm-style events, or `body_completo.alarmId`
+for `iotEvent`) when available, else a deterministic SHA-256 hash of
+`deviceId|eventType|timestamp|payload`. `audit` checks `existsByDedupKey(eventId)`
+before processing; a duplicate is logged and skipped. A database-level unique
+constraint on `event_id` backs this up against race conditions.
 
 ## Retry and handling of unprocessable messages
 
-A handler failure retries 3 times with exponential backoff (1s, 2s, 4s) via Spring
-Kafka's `DefaultErrorHandler`. If still failing, the record is published to that
-topic's dead-letter topic (`<topic>.DLT`) and the failure is logged with full
-context (topic, partition, offset, key, exception) — no audit row is written for a
-failed event. Replay from a DLT is a deliberate, manual operational action (e.g.
-inspecting the DLT, fixing the root cause, republishing), not automated by this
-application, to avoid silently reprocessing something that may need a human
-decision first.
+A handler failure retries 3 times with exponential backoff (1s, 2s, 4s). If still
+failing, the record is dead-lettered to `<topic>.DLT` and logged with full context —
+no audit row is written. Replay from a DLT is a deliberate, manual operational action,
+not automated by this application.
 
 ## Observability
 
-Every behaviour (`SimulateIngestionUseCase`, `RecordDeviceEventAuditUseCase`,
-`QueryAuditsUseCase`, each Kafka listener) emits exactly one structured log line —
-success or failure — carrying topic/partition/offset/key context for Kafka-driven
-behaviours. Metrics (`device_events_processed_total`,
-`device_events_duplicate_total`, `device_events_dlq_total`, plus Kafka consumer lag)
-are exposed via Micrometer/Actuator at `/actuator/prometheus`, scraped by Prometheus,
-and visualized in a provisioned Grafana dashboard.
+Every behaviour emits exactly one structured log line (success or failure), carrying
+topic/partition/offset/key context for Kafka-driven behaviours. Metrics
+(`device_events_processed_total`, `device_events_duplicate_total`,
+`device_events_dlq_total`, Kafka consumer lag) are scraped by Prometheus and shown in
+a provisioned Grafana dashboard.
 
 ## Availability and fault tolerance
 
-A single bad message (malformed payload, forced failure) never blocks a partition
-beyond its retry budget — it's dead-lettered and the partition continues with the
-next offset. The CSV adapter tolerates malformed individual rows at ingestion
-without aborting the whole batch. At production scale, running Kafka with a
-replication factor > 1 (this case's local Kafka is a single-node KRaft broker for
-simplicity) and multiple audit-service instances would remove single points of
-failure on both the broker and consumer sides.
+A single bad message never blocks a partition beyond its retry budget. The CSV adapter
+tolerates malformed individual rows without aborting the batch (demonstrated by the
+real dataset's 2 blank-`did` rows, resolved via a fallback rather than dropped). At
+production scale, Kafka replication factor > 1 and multiple `audit-service` instances
+would remove single points of failure (this case's local Kafka is a single-node KRaft
+broker for simplicity).
 ```
 
-- [ ] **Step 3: Write `DECISIONS.md`**
+- [ ] **Step 3: `DECISIONS.md`**
 
 ```markdown
 # Technical Decisions & Trade-offs (Bloco C)
 
 | Decision | Alternative considered | Why this way |
 |---|---|---|
-| Topic-per-device-type | Single topic with a type field; one topic per event type | Matches how device domains naturally evolve/scale independently; still preserves per-device ordering via the `deviceId` key |
-| Two independent domains (`device`, `audit`), communicating only via Kafka JSON | One domain covering ingestion, processing, and audit | Models audit as one of potentially several independent consumers of the event stream; a future `notification` domain could consume the same topics with zero coupling |
-| Ports as Java interfaces, standard Spring autowiring | Abstract classes; manual composition root | Idiomatic Java/Spring; same dependency-inversion guarantee without fighting the framework |
-| `eventId` computed once in `device.core`, carried as wire data | Each consumer re-derives its own dedup key | Keeps identity computation in one place; consumers trust the message instead of re-deriving it |
-| Duplicates: log only, no audit row | Persist a `DUPLICATE`-status row | The audit table should only ever reflect successfully processed events |
-| Failures: log + DLQ only, no audit row, no `status` field on `AuditRecord` | Persist a `FAILED`-status row | Simplifies the schema since only one outcome (success) is ever persisted |
+| `EventCategory` derived from the real `msgType` field | A fabricated `device_type` column (the original assumption, before the real CSV arrived) | The real data has no such column; `msgType` is the only always-present categorical field and maps directly onto the case brief's own four event kinds |
+| 4 topics, grouping `msgType`'s 11 raw values | One topic per raw `msgType` | 11 topics for very uneven volumes (1 row up to 45 rows) fragments operations for no benefit at this scale |
+| `timestamp_log` as the single timestamp source, parsed via `OffsetDateTime` | The nested `utcTime`/`time` fields inside `body_completo` | Those vary format (epoch seconds vs. compact strings) by message family; `timestamp_log` is uniform across all 100 rows |
+| Native id (`body_completo.id`/`alarmId`) preferred over hash, when present | Always hash | Real native ids exist for 26/100 rows, verified unique; more faithful to the source system |
+| Blank `did` → fallback to `body_completo.deviceId` → `"UNKNOWN"` | Reject the row at ingestion | Demonstrates RT04 tolerance on real, mildly inconsistent data instead of dropping 2 real rows |
+| DLQ demo via 4 appended synthetic rows, clearly labeled | Force a failure into a real row; cover DLQ only in the integration test | The case explicitly allows adding events beyond the original 100; a labeled synthetic row keeps the real dataset unmodified and still demonstrates retry/DLQ live via `docker compose` |
+| Two independent domains (`device`, `audit`) | One domain covering ingestion+processing+audit | Audit is one of potentially several independent consumers of the event stream (e.g. a future `notification` domain) |
+| Ports as Java interfaces, standard Spring autowiring | Abstract classes; manual composition root | Idiomatic Java/Spring; same dependency-inversion guarantee |
+| Duplicates/failures: log only, no audit row, no `status` field | Persist `DUPLICATE`/`FAILED` rows | The audit table should only ever reflect successfully processed events |
 | PostgreSQL for the audit store | H2 | Real persistence across restarts; works with Testcontainers and the Docker Compose bonus |
-| Spring Kafka `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` | Manual try/catch per listener | Standard, well-documented retry/DLQ pattern |
-| One structured `ExecutionLog` per behaviour | Scattered `logger.info` calls | Every behaviour's outcome is a single, greppable, structured line — easy to trace one event's path through logs |
-| Sample CSV + CSV adapter as an isolated seam | Hardcoding the real dataset's assumptions everywhere | The real 100-event CSV wasn't available during development; only `CsvEventSourceAdapter` and the sample file should need to change when it arrives |
+| One structured `ExecutionLog` per behaviour | Scattered `logger.info` calls | Every behaviour's outcome is a single, greppable, structured line |
 
-## Known limitations (acknowledged, not fixed in this submission)
+## Known limitations
 
-- The real CSV dataset was not provided; `events.csv` is a representative sample built
-  from the case's own description (camera/sensor/alarm events, one unrecognized
-  device type, one forced-failure row).
 - No authentication/authorization on the REST endpoints — out of scope for the case.
-- DLT replay is manual, by design — not automated.
-- A frontend for browsing `/audits` is a planned separate project, not part of this
-  submission.
+- DLT replay is manual, by design.
+- A frontend for browsing `/audits` is a planned separate project, not part of this submission.
 ```
 
-- [ ] **Step 4: Commit**
-
-```bash
-git add ARCHITECTURE.md DECISIONS.md
-git commit -m "docs: add Bloco B architecture and Bloco C decisions deliverables"
-```
-
-- [ ] **Step 5: Merge back to main**
-
-```bash
-git checkout main
-git merge --no-ff docs/bloco-b-c-deliverables
-git branch -d docs/bloco-b-c-deliverables
-```
+- [ ] **Step 4: Commit** — `git add ARCHITECTURE.md DECISIONS.md && git commit -m "docs: add Bloco B architecture and Bloco C decisions deliverables"`
+- [ ] **Step 5: Merge** — `git checkout main && git merge --no-ff docs/bloco-b-c-deliverables && git branch -d docs/bloco-b-c-deliverables`
