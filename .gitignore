@@ -28,3 +28,6 @@ case_information/
 
 # superpowers plan execution scratch workspace
 .superpowers/
+
+# local user-scoped JDK 21 + Maven (sandbox only ships Java 11 / no Maven)
+.tooling/
