@@ -137,13 +137,26 @@ cd case_intelbras_kafka_java
 
 ### Fastest path: three scripts
 
-If you just want this running with minimal typing:
+If you just want this running with minimal typing, run these exact commands in your
+terminal, from inside the `case_intelbras_kafka_java` folder, in this order:
 
-```bash
-./setup.sh   # checks Docker is installed/running, builds and pulls every image
-./run.sh     # starts everything, triggers the demo ingestion, prints the URLs/results
-./test.sh    # runs the full test suite locally (unit tests + the Testcontainers integration test)
-```
+1. Check prerequisites and build/pull every image:
+
+   ```bash
+   ./setup.sh
+   ```
+
+2. Start everything, trigger the demo ingestion, and print the URLs/results:
+
+   ```bash
+   ./run.sh
+   ```
+
+3. Run the full test suite locally (unit tests + the Testcontainers integration test):
+
+   ```bash
+   ./test.sh
+   ```
 
 `./run.sh` ends by printing exactly what Step 4–5 below show manually (the audit count,
 the metrics, the Grafana URL). The rest of this section walks through the same thing
