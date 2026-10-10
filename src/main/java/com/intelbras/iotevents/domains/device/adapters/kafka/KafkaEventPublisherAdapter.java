@@ -10,6 +10,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class KafkaEventPublisherAdapter implements EventPublisherPort {
@@ -33,7 +34,7 @@ public class KafkaEventPublisherAdapter implements EventPublisherPort {
             String payload = objectMapper.writeValueAsString(toWireMessage(event));
             log.context("topic", topic).step("Serialized device event to wire JSON");
 
-            kafkaTemplate.send(topic, event.deviceId(), payload);
+            kafkaTemplate.send(topic, event.deviceId(), payload).get(10, TimeUnit.SECONDS);
             log.step("Published event to Kafka", Map.of("topic", topic, "key", event.deviceId()));
 
             log.info("Published device event");
