@@ -31,3 +31,11 @@ case_information/
 
 # local user-scoped JDK 21 + Maven (sandbox only ships Java 11 / no Maven)
 .tooling/
+
+# Maven
+target/
+
+# IDE
+.idea/
+*.iml
+.vscode/
