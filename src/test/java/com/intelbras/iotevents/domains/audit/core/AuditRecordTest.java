@@ -21,6 +21,7 @@ class AuditRecordTest {
         assertThat(record.eventCategory()).isEqualTo("PROPERTY_CHANGE");
         assertThat(record.eventType()).isEqualTo("iotProperty");
         assertThat(record.generalInfo()).isEqualTo("Device DEVICE-00014 reported a property change");
+        assertThat(record.eventTimestamp()).isEqualTo(Instant.parse("2026-09-25T08:47:51.157000Z"));
         assertThat(record.consumedAt()).isEqualTo(record.createdAt());
     }
 }

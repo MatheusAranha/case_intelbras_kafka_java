@@ -37,10 +37,10 @@ public class JpaAuditRepositoryAdapter implements AuditRepositoryPort {
             spec = spec.and((root, q, cb) -> cb.equal(root.get("eventType"), filter.eventType()));
         }
         if (filter.from() != null) {
-            spec = spec.and((root, q, cb) -> cb.greaterThanOrEqualTo(root.get("consumedAt"), filter.from()));
+            spec = spec.and((root, q, cb) -> cb.greaterThanOrEqualTo(root.get("eventTimestamp"), filter.from()));
         }
         if (filter.to() != null) {
-            spec = spec.and((root, q, cb) -> cb.lessThanOrEqualTo(root.get("consumedAt"), filter.to()));
+            spec = spec.and((root, q, cb) -> cb.lessThanOrEqualTo(root.get("eventTimestamp"), filter.to()));
         }
         return repository.findAll(spec).stream().map(AuditMapper::toDomain).toList();
     }

@@ -30,6 +30,9 @@ public class AuditJpaEntity {
     @Column(name = "event_type", nullable = false)
     private String eventType;
 
+    @Column(name = "event_timestamp", nullable = false)
+    private Instant eventTimestamp;
+
     @Column(name = "general_info", nullable = false, columnDefinition = "TEXT")
     private String generalInfo;
 
@@ -43,11 +46,12 @@ public class AuditJpaEntity {
     }
 
     public AuditJpaEntity(String eventId, String deviceId, String eventCategory, String eventType,
-                           String generalInfo, Instant consumedAt, Instant createdAt) {
+                           Instant eventTimestamp, String generalInfo, Instant consumedAt, Instant createdAt) {
         this.eventId = eventId;
         this.deviceId = deviceId;
         this.eventCategory = eventCategory;
         this.eventType = eventType;
+        this.eventTimestamp = eventTimestamp;
         this.generalInfo = generalInfo;
         this.consumedAt = consumedAt;
         this.createdAt = createdAt;
@@ -71,6 +75,10 @@ public class AuditJpaEntity {
 
     public String getEventType() {
         return eventType;
+    }
+
+    public Instant getEventTimestamp() {
+        return eventTimestamp;
     }
 
     public String getGeneralInfo() {

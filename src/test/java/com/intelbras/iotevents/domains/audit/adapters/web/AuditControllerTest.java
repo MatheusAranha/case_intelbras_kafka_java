@@ -29,8 +29,8 @@ class AuditControllerTest {
     @Test
     void shouldReturnAuditsMatchingTheGivenFilter() throws Exception {
         AuditRecord record = new AuditRecord("evt-1", "DEVICE-00014", "PROPERTY_CHANGE", "iotProperty",
-            "Device DEVICE-00014 reported a property change", Instant.parse("2026-09-25T08:47:51.157000Z"),
-            Instant.parse("2026-09-25T08:47:51.157000Z"));
+            Instant.parse("2026-09-25T08:47:51.157000Z"), "Device DEVICE-00014 reported a property change",
+            Instant.parse("2026-09-25T08:47:51.157000Z"), Instant.parse("2026-09-25T08:47:51.157000Z"));
         when(queryAuditsUseCase.execute(new AuditQueryFilter("DEVICE-00014", null, null, null))).thenReturn(List.of(record));
 
         mockMvc.perform(get("/audits").param("deviceId", "DEVICE-00014"))
