@@ -1,211 +1,223 @@
 # IoT Device Event Processing — Design Spec
 
-Date: 2026-10-10
+Date: 2026-10-10 (revised after receiving the real dataset)
 Status: Approved by user, ready for implementation planning
+
+## 0. Revision note
+
+This spec was originally written before the real CSV dataset arrived, against an
+assumed schema (`id, device_id, device_type, event_type, timestamp, payload_json`).
+The real dataset (`case_information/case_backend_senior_eventos_sanitizados 1.csv`,
+100 rows) has a completely different shape. This revision replaces every section
+that depended on the assumed schema. The core architecture (hexagonal, two domains,
+4-topic Kafka layout, idempotency/retry/DLQ strategy) is unchanged — only the field
+mapping and the classification dimension change.
 
 ## 1. Context
 
 This is a take-home case for an Intelbras Backend Sênior (Java) position
 (full brief in `case_information/case.md`). The goal: ingest a CSV of IoT
-device events ("Casa Inteligente" ecosystem — cameras, sensors, alarms),
-publish them to Apache Kafka, and process them through consumers in a way
-that demonstrates production-grade event-driven architecture: ordering,
-idempotency, retry/DLQ, observability, and testability.
+device events ("Casa Inteligente" ecosystem), publish them to Apache Kafka,
+and process them through consumers in a way that demonstrates production-grade
+event-driven architecture: ordering, idempotency, retry/DLQ, observability,
+and testability.
 
 **Deliverables required by the case** (mapped to this design):
 - Bloco A (Implementation): Sections 3–8 below.
-- Bloco B (Architecture): Sections 3–5, write-up to be produced separately
-  describing partitioning/scaling, consumer groups, ordering, idempotency,
-  retry/DLQ, observability, fault tolerance for a millions-events/day scale.
-- Bloco C (Technical decisions): this spec + its "Decisions & trade-offs"
-  section (9) serves as the source material.
+- Bloco B (Architecture): Sections 3–5, write-up in `ARCHITECTURE.md` describing
+  partitioning/scaling, consumer groups, ordering, idempotency, retry/DLQ,
+  observability, fault tolerance for a millions-events/day scale.
+- Bloco C (Technical decisions): this spec + `DECISIONS.md`.
 - Bonus targets: GitHub versioning (already a git repo), Docker Compose
   local run, metrics/observability (Prometheus + Grafana), Kafka
   integration tests (Testcontainers).
 
-**Known constraint**: the real 100-event CSV has not been provided yet.
-The schema below is a plausible IoT event model inferred from the case
-brief (property changes, status changes, motion detection). When the real
-CSV arrives, only `device.adapters.csv.CsvEventSourceAdapter` and the
-sample CSV resource should need to change — this is the seam the design
-isolates for exactly that reason.
+## 2. The real dataset
 
-## 2. Tech stack
+`case_information/case_backend_senior_eventos_sanitizados 1.csv` — 100 rows,
+columns: `event_number, timestamp_log, msgType, did, dname, pid, parentDid,
+parentPid, utcTime, userId, oauthProject, content, body_completo`.
 
-- Java, Maven, Spring Boot (spring-kafka, spring-data-jpa, spring-boot-actuator)
-- PostgreSQL (audit persistence)
-- Apache Kafka (KRaft mode — no ZooKeeper)
-- Micrometer + Prometheus + Grafana (observability)
-- JUnit 5 + Testcontainers (Kafka, Postgres) for integration tests
-- Docker Compose for local orchestration
+Key facts, established by direct inspection:
 
-## 3. Architecture style
+- **`msgType`** is the real categorical dimension (always present, never blank).
+  Distribution across the 100 rows: `iotProperty`(45), `online`(18),
+  `videoMotion`(12), `offline`(7), `iotEvent`(6), `mobileDetect`(4), `human`(3),
+  `informationTransfer`(2), `openCamera`(1), `smartVideoMotion`(1), `upgradeFail`(1).
+  There is no `device_type` column, and the `deviceType` string occasionally
+  found nested inside `body_completo` (`IPC`, `XFAMTXB5`, ...) is an anonymized
+  product code, not a usable camera/sensor/alarm classification.
+- **`timestamp_log`** is present and ISO-8601-with-offset (e.g.
+  `2026-09-25T08:47:51.157000+00:00`) on all 100 rows — the reliable, uniform
+  timestamp source. Timestamps nested inside `body_completo` vary in format by
+  message family (epoch seconds for camera/alarm events, compact
+  `yyyyMMdd'T'HHmmss` strings for IoT-platform events) and are NOT used as the
+  parsed timestamp.
+- **`content`** is always valid JSON (verified on all 100 rows), sometimes `{}`.
+  It is the event's payload.
+- **`body_completo`** is the full raw envelope as originally emitted. It is only
+  consulted for two fallback lookups (see Section 4) — never stored as the
+  event's payload.
+- **A native unique id exists only for alarm-style events**: `body_completo.id`
+  (present on `videoMotion`/`mobileDetect`/`human`/`smartVideoMotion`, 20 rows,
+  globally unique, JSON number) and `body_completo.alarmId` (present on
+  `iotEvent`, 6 rows, unique, JSON string). The other 74 rows have no native id.
+  `event_number` is a CSV row index, not a usable business id — it is ignored.
+- **2 rows** (`informationTransfer`) have a blank `did`; both carry a `deviceId`
+  field inside `body_completo` instead (`FJ1K2001704PS`, `IA8L4001890ZN`).
 
-Hexagonal (ports & adapters), organized **domain-per-feature**, not
-layer-per-feature. Two bounded contexts, each independent:
+## 3. Classification: `EventCategory`, derived from `msgType`
+
+The case brief itself names four kinds of event: "alterações de propriedades,
+mudanças de status, detecção de movimento e outros eventos." That maps directly
+onto `msgType`, and reuses the same 4-topic Kafka layout this design already
+called for — just with a real classification instead of a fabricated one:
+
+| `EventCategory` | `msgType` values | Row count |
+|---|---|---|
+| `PROPERTY_CHANGE` | `iotProperty` | 45 |
+| `STATUS_CHANGE` | `online`, `offline` | 25 |
+| `MOTION_DETECTION` | `videoMotion`, `mobileDetect`, `human`, `smartVideoMotion` (all four carry `labelType: motionAlarm`/`humanAlarm` in `body_completo`) | 20 |
+| `OTHER` | `iotEvent`, `informationTransfer`, `openCamera`, `upgradeFail`, and any unrecognized future `msgType` (fallback) | 10 |
+
+## 4. Tech stack
+
+Unchanged: Java, Maven, Spring Boot (spring-kafka, spring-data-jpa,
+spring-boot-actuator), PostgreSQL, Apache Kafka (KRaft), Micrometer + Prometheus
++ Grafana, JUnit 5 + Testcontainers, Docker Compose.
+
+## 5. Architecture style
+
+Unchanged: hexagonal (ports & adapters), domain-per-feature. Two bounded
+contexts, each independent:
 
 ```
 com.intelbras.iotevents
 ├── domains/
 │   ├── device/                      # owns event creation & publishing
 │   │   ├── core/
-│   │   │   ├── DeviceEvent.java             entity: eventId, deviceId, deviceType, eventType, timestamp, payload
-│   │   │   ├── DeviceType.java              enum: CAMERA, SENSOR, ALARM, GENERIC
-│   │   │   ├── EventType.java               enum: PROPERTY_CHANGE, STATUS_CHANGE, MOTION_DETECTED, ... (extensible)
-│   │   │   ├── error/
-│   │   │   │   └── DeviceEventValidationError.java
-│   │   │   ├── port/
-│   │   │   │   ├── EventSourcePort.java     interface: List<DeviceEvent> readAll()
-│   │   │   │   └── EventPublisherPort.java  interface: void publish(DeviceEvent)
-│   │   │   └── usecase/
-│   │   │       └── SimulateIngestionUseCase.java
+│   │   │   ├── DeviceEvent.java             entity: eventId, deviceId, eventCategory, eventType (raw msgType), timestamp, payload
+│   │   │   ├── EventCategory.java           enum: PROPERTY_CHANGE, STATUS_CHANGE, MOTION_DETECTION, OTHER — EventCategory.fromMsgType(String)
+│   │   │   ├── error/DeviceEventValidationError.java
+│   │   │   ├── port/EventSourcePort.java / EventPublisherPort.java
+│   │   │   └── usecase/SimulateIngestionUseCase.java
 │   │   └── adapters/
-│   │       ├── csv/CsvEventSourceAdapter.java          implements EventSourcePort
-│   │       ├── kafka/KafkaEventPublisherAdapter.java   implements EventPublisherPort
+│   │       ├── csv/CsvEventSourceAdapter.java          reads events.csv, parses content + body_completo fallbacks
+│   │       ├── kafka/KafkaEventPublisherAdapter.java   resolves topic from eventCategory
 │   │       └── web/EventSimulationController.java      POST /events/simulate
 │   │
 │   └── audit/                       # owns dedup + audit trail of processed events
 │       ├── core/
-│       │   ├── AuditRecord.java             entity: dedupKey, deviceId, deviceType, eventType, generalInfo, consumedAt, createdAt
-│       │   ├── IncomingDeviceEvent.java     audit's OWN value object for an event it consumes (NOT device.core.DeviceEvent)
-│       │   ├── port/
-│       │   │   └── AuditRepositoryPort.java interface: save, existsByDedupKey, query(filters)
+│       │   ├── AuditRecord.java             entity: dedupKey, deviceId, eventCategory, eventType, generalInfo, consumedAt, createdAt
+│       │   ├── IncomingDeviceEvent.java     audit's OWN value object (eventId, deviceId, eventCategory:String, eventType:String, timestamp, payload)
+│       │   ├── port/AuditRepositoryPort.java
 │       │   ├── handler/
-│       │   │   ├── DeviceEventAuditHandler.java   interface: String handle(IncomingDeviceEvent)
-│       │   │   ├── CameraEventAuditHandler.java
-│       │   │   ├── SensorEventAuditHandler.java
-│       │   │   ├── AlarmEventAuditHandler.java
-│       │   │   └── GenericEventAuditHandler.java
-│       │   └── usecase/
-│       │       ├── RecordDeviceEventAuditUseCase.java   dedup check -> handler -> save (only on success)
-│       │       └── QueryAuditsUseCase.java
+│       │   │   ├── DeviceEventAuditHandler.java   interface: String handle(IncomingDeviceEvent); boolean supports(String eventCategory)
+│       │   │   ├── PropertyChangeEventAuditHandler.java
+│       │   │   ├── StatusChangeEventAuditHandler.java
+│       │   │   ├── MotionDetectionEventAuditHandler.java
+│       │   │   └── OtherEventAuditHandler.java   (also the designated fallback)
+│       │   └── usecase/RecordDeviceEventAuditUseCase.java / QueryAuditsUseCase.java
 │       └── adapters/
-│           ├── kafka/
-│           │   ├── listener/
-│           │   │   ├── CameraEventListener.java
-│           │   │   ├── SensorEventListener.java
-│           │   │   ├── AlarmEventListener.java
-│           │   │   └── GenericEventListener.java
-│           │   └── DeviceEventDlqRecoverer.java   logs + republishes to <topic>.DLT, no DB write
-│           ├── persistence/
-│           │   ├── JpaAuditRepositoryAdapter.java   implements AuditRepositoryPort
-│           │   ├── AuditJpaEntity.java              JPA entity, unique constraint on event_id
-│           │   └── AuditMapper.java
+│           ├── kafka/listener/PropertyChangeEventListener.java / StatusChangeEventListener.java / MotionDetectionEventListener.java / OtherEventListener.java
+│           ├── kafka/DeviceEventDlqRecoverer.java
+│           ├── persistence/JpaAuditRepositoryAdapter.java + AuditJpaEntity.java + AuditMapper.java
 │           └── web/AuditController.java             GET /audits
 │
-└── config/                           # cross-cutting Spring wiring, not business logic
-    ├── KafkaConfig.java              topics, error handler, DLQ recoverer, consumer factory (concurrency)
-    ├── MetricsConfig.java            Micrometer custom metrics registration
-    └── JacksonConfig.java
+└── config/                           KafkaTopics, KafkaTopicConfig, KafkaErrorHandlingConfig
 ```
 
-**Rules**:
-- `core/` packages contain zero Spring/Kafka/JPA imports — pure Java, unit-testable without infra.
-- `core/usecase` depends only on `core/port` interfaces, never on `adapters/`.
-- Ports are Java interfaces (not abstract classes) — idiomatic for Spring's `@Component`-based autowiring, and doesn't block a class from implementing more than one port.
-- DI is standard Spring autowiring (constructor injection, `@Service`/`@Component`/`@Repository` stereotypes) — no manual composition root. The use case still only ever references the port interface, so the dependency-inversion property holds regardless of who performs the wiring.
-- **No cross-domain Java imports.** `audit` never imports anything from `device.core`. The only thing crossing the boundary is the Kafka message itself (JSON), which `audit.adapters.kafka.listener.*` deserializes into `audit.core.IncomingDeviceEvent`. This is what allows a future third domain (e.g. `notification`) to consume the same topics independently, with its own interpretation of the event, without any coupling to `device` or `audit` Java types.
+Same rules as before: `core/` has zero framework imports; no cross-domain Java
+imports (`audit` never imports `device.core.*`); ports are Java interfaces,
+Spring-autowired.
 
-## 4. Domain models & wire contract
+## 6. Field mapping (real CSV → domain model)
 
-**`DeviceEvent` (device.core)**:
-```
-eventId: String       // CSV's own id column if present; otherwise sha256(deviceId+eventType+timestamp+payload)
-deviceId: String
-deviceType: DeviceType // CAMERA | SENSOR | ALARM | GENERIC
-eventType: EventType
-timestamp: Instant
-payload: Map<String,Object>
-```
-`eventId` is computed once, in `device.core`, at event-construction time — it is the identity every independent consumer dedupes on.
+| Domain field | Source | Notes |
+|---|---|---|
+| `DeviceEvent.deviceId` | `did` column | If blank, fall back to `body_completo.deviceId`; if still absent, `"UNKNOWN"`. Only `informationTransfer` rows hit the fallback in the real data, and both resolve successfully. |
+| `DeviceEvent.eventType` | `msgType` column, unmodified casing | Kept verbatim (e.g. `"videoMotion"`) — it's the platform's own real vocabulary, not free text to normalize. |
+| `DeviceEvent.eventCategory` | `EventCategory.fromMsgType(msgType)` | Drives topic routing (Section 3). |
+| `DeviceEvent.timestamp` | `timestamp_log` column | Parsed via `OffsetDateTime.parse(...).toInstant()` — NOT `Instant.parse`, because the format uses explicit `+00:00` offsets rather than literal `Z`. |
+| `DeviceEvent.payload` | `content` column, parsed as JSON | Always present and valid in the real data; parse failure (shouldn't occur) falls back to an empty map, consistent with CSV-row tolerance. |
+| `DeviceEvent.eventId` (dedup key) | `body_completo.id` → else `body_completo.alarmId` → else `DedupKeyGenerator.generate(deviceId, eventType, timestampRaw, payload)` | Both native-id fields are confirmed globally unique within their respective rows; the hash fallback covers the other 74 rows (and the synthetic DLQ-demo rows, Section 7). |
 
-**Wire contract (Kafka message value, JSON)** — this is the actual contract between domains, not a shared Java class:
-```json
-{
-  "eventId": "string",
-  "deviceId": "string",
-  "deviceType": "CAMERA|SENSOR|ALARM|GENERIC",
-  "eventType": "string",
-  "timestamp": "ISO-8601",
-  "payload": { "...": "..." }
-}
-```
+`body_completo` is parsed by the CSV adapter solely to extract `deviceId`/`id`/`alarmId`
+when needed — it is never stored on `DeviceEvent` and never reaches Kafka.
 
-**`IncomingDeviceEvent` (audit.core)**: structurally mirrors the wire contract's fields but is a distinct type owned by `audit`, built by `audit`'s own Kafka listeners. Deliberately not shared with `device.core.DeviceEvent`.
+## 7. Demonstrating the DLQ path without touching real data
 
-**`AuditRecord` (audit.core)**:
-```
-dedupKey: String    // == eventId from the wire contract
-deviceId: String
-deviceType: String
-eventType: String
-generalInfo: String  // produced by the matching DeviceEventAuditHandler
-consumedAt: Instant
-createdAt: Instant
-```
-No status field — every row that exists is, by construction, a successfully processed event (see Section 6).
+The real 100 rows are all expected to process successfully — there's no
+naturally-occurring "poison pill" in anonymized production data, and fabricating
+a failure inside a real row would misrepresent the dataset. Per the case's own
+"Importante" section, additional events beyond the original 100 are allowed, so
+`src/main/resources/events.csv` is the real 100 rows **plus 4 appended synthetic
+rows** (`event_number` 101–104), one per `EventCategory`, each carrying
+`"simulateFailure": true` in its `content`. They use obviously fake identifiers
+(`SYNTHETIC-DLQ-001..004`) and are called out as fabricated in `README.md` and
+`ARCHITECTURE.md` — never mixed into the real data without being labeled as such.
 
-**Assumed CSV columns** (sample CSV to be created under `src/main/resources/events.csv` for the demo, ~20–30 rows covering all four device types and at least one intentionally malformed row for the DLQ demo):
-```
-id, device_id, device_type, event_type, timestamp, payload_json
-```
-`id` and `payload_json` may be absent/malformed in the real dataset — `CsvEventSourceAdapter` must tolerate a missing `id` (falls back to the hash) and a missing/invalid `payload_json` (defaults to an empty map), without ever throwing out of the whole ingestion run for one bad row (RT04).
+The existing `RecordDeviceEventAuditUseCase` check
+(`payload.get("simulateFailure") == true` → throw `SimulatedProcessingFailureError`)
+needed no change for this — it was already generic.
 
-## 5. Kafka topology
+## 8. Kafka topology
 
 | Topic | Partitions | Key |
 |---|---|---|
-| `device.camera.events` | 3 | `deviceId` |
-| `device.sensor.events` | 3 | `deviceId` |
-| `device.alarm.events` | 3 | `deviceId` |
-| `device.generic.events` | 3 | `deviceId` |
+| `device.property-change.events` | 3 | `deviceId` |
+| `device.status-change.events` | 3 | `deviceId` |
+| `device.motion-detection.events` | 3 | `deviceId` |
+| `device.other.events` | 3 | `deviceId` |
 
-- Partitioning by `deviceId` guarantees per-device ordering while spreading different devices across partitions for parallelism.
-- Single consumer group `audit-service` shared across all four listener classes (one logical consuming application).
-- Listener concurrency = 3 per topic (matches partition count) for intra-topic parallel processing.
-- Each topic has a matching `<topic>.DLT` dead-letter topic (e.g. `device.camera.events.DLT`), 1 partition each (low volume by design).
+Each topic has a matching `<topic>.DLT` (1 partition). Single consumer group
+`audit-service`, concurrency 3 per listener — unchanged from the original design.
 
-## 6. Data flow
+## 9. Data flow
 
-**Happy path**: `POST /events/simulate` → `CsvEventSourceAdapter.readAll()` → `SimulateIngestionUseCase` builds a validated `DeviceEvent` per row (computing `eventId`) → `KafkaEventPublisherAdapter.publish()` resolves topic from `deviceType`, publishes keyed by `deviceId` → matching `audit` listener deserializes into `IncomingDeviceEvent` → `RecordDeviceEventAuditUseCase`: `existsByDedupKey(eventId)` is false → matching `DeviceEventAuditHandler.handle()` produces `generalInfo` → `AuditRecord` saved.
+Unchanged in shape from the original design (happy / duplicate / failure paths);
+only the classification label changed:
 
-**Duplicate path**: same `eventId` arrives again → `existsByDedupKey(eventId)` is true → **log only** ("skipped duplicate event eventId=... deviceId=...") → handler is never invoked, no DB write, use case returns without error.
+**Happy path**: `POST /events/simulate` → `CsvEventSourceAdapter.readAll()` parses
+all 104 rows (100 real + 4 synthetic) into validated `DeviceEvent`s → published
+keyed by `deviceId` to the topic resolved from `eventCategory` → matching `audit`
+listener → dedup check → category handler builds `generalInfo` → `AuditRecord` saved.
 
-**Failure path**: handler throws → Spring Kafka `DefaultErrorHandler` retries with backoff (3 attempts, exponential 1s/2s/4s) → still failing → `DeviceEventDlqRecoverer` logs the failure (deviceId, eventType, exception) and publishes the original record to `<topic>.DLT` → **no DB write at all**. The DLT topic is the durable record of the failure; replay/inspection is a manual operational action, described (not automated) in the Bloco B write-up.
+**Duplicate path**: same `eventId` arrives again → logged only, no audit row,
+no error (unchanged).
 
-To make the failure path demoable, one row in the sample CSV carries a deliberately unrecognized `event_type` value that the matching handler treats as unprocessable and throws on.
+**Failure path**: only the 4 synthetic rows exercise this — handler throws
+`SimulatedProcessingFailureError` → retry with backoff → dead-lettered to
+`<topic>.DLT` → logged only, no audit row (unchanged).
 
-## 7. REST API
+## 10. REST API
 
-- `POST /events/simulate` — triggers `SimulateIngestionUseCase`: reads the bundled CSV, publishes every row to Kafka. Can be called repeatedly to demonstrate the duplicate path.
-- `GET /audits` — `QueryAuditsUseCase`, filterable by `deviceId`, `eventType`, and a date range; returns persisted `AuditRecord`s. Exists to support a future separate frontend project; no frontend is built as part of this deliverable.
+Unchanged: `POST /events/simulate`, `GET /audits?deviceId=&eventType=&from=&to=`.
+`eventType` here filters on the raw `msgType` value (e.g. `videoMotion`), not the
+broader category.
 
-## 8. Observability, testing, and local run
+## 11. Observability, testing, and local run
 
-**Observability**: Spring Boot Actuator + Micrometer, `/actuator/prometheus` endpoint. Custom metrics: events-processed counter (tagged `deviceType`, `eventType`), duplicates-skipped counter, DLQ counter, handler-processing-duration timer, plus Micrometer's built-in Kafka consumer-lag metrics. `docker-compose.yml` includes `prometheus` (scrape config targeting the app) and `grafana` (pre-provisioned datasource + one dashboard JSON checked into the repo).
+Unchanged from the original design (Actuator/Micrometer/Prometheus/Grafana;
+unit tests for `core/`; Testcontainers integration tests for the full flow).
+Integration test assertions are now based on the real dataset's actual counts
+(104 total published; 100 real rows audited; 4 synthetic rows dead-lettered,
+zero audit rows for them) rather than a fabricated row-count.
 
-**Testing**:
-- Unit (no infra): CSV row → `DeviceEvent` mapping including malformed-row tolerance; `eventId` generation (CSV id vs. hash fallback); each `DeviceEventAuditHandler`'s `generalInfo` output; deviceType → topic resolution.
-- Integration (Testcontainers — real Kafka + Postgres): full simulate → publish → consume → audit-persisted flow; a duplicate-event test asserting exactly one `AuditRecord` exists and the handler is invoked only once; a forced-failure test asserting the record lands on `<topic>.DLT` and that no `AuditRecord` is written for it.
-
-**Docker Compose services**: `kafka` (KRaft), `postgres`, `prometheus`, `grafana`, `app`. Single `docker compose up` brings up the full stack (bonus ★★).
-
-## 9. Decisions & trade-offs (seed material for Bloco C)
+## 12. Decisions & trade-offs (seed material for Bloco C)
 
 | Decision | Alternative considered | Why this way |
 |---|---|---|
-| Topic-per-device-type (not per-event-type, not single topic) | Single topic with type field; one topic per event type | Matches how device domains naturally evolve/scale independently in a real IoT platform; still preserves per-device ordering via the `deviceId` key within each topic |
-| Two independent domains (`device`, `audit`), communicating only via the Kafka wire contract | One domain covering ingestion+processing+audit | Models audit as one of potentially several independent consumers (e.g. a future `notification` domain) of the same event stream, without cross-domain Java coupling |
-| Ports as Java interfaces, Spring-autowired | Abstract classes; manual `@Configuration`/`@Bean` composition root (both from the user's TS template conventions) | Idiomatic Java/Spring; same dependency-inversion guarantee without fighting the framework |
-| `eventId` computed once in `device.core`, carried as wire data | Each consumer independently derives its own dedup key | Keeps identity computation in one place; consumers trust the message instead of re-deriving, while still able to interpret the event independently |
-| Duplicates: log only, no audit row | Persist a `DUPLICATE`-status row | Matches the user's explicit requirement — the audit table should only ever reflect successfully processed events |
-| Failures: log + DLQ only, no audit row, no `status` field on `AuditRecord` | Persist a `FAILED`-status row | Same as above — simplifies the schema since only one outcome (success) is ever persisted |
-| PostgreSQL for the audit store | H2 | Real persistence across restarts, works with Testcontainers integration tests and the Docker Compose bonus |
-| Spring Kafka `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` | Manual try/catch per listener | Standard, well-documented retry/DLQ pattern; strong material for the Bloco B architecture discussion |
+| `EventCategory` derived from `msgType`, not a fabricated `device_type` | Keep the originally-assumed `device_type` column | The real data has no such column; `msgType` is the only always-present categorical field, and it maps directly onto the case brief's own four event kinds |
+| 4 topics, same layout as originally designed | Redesign topic count/shape around `msgType`'s 11 raw values | Topic-per-raw-msgType would be 11 thin topics for very uneven volumes (1 row up to 45 rows); grouping into the case's own 4 named categories keeps partitioning meaningful |
+| `timestamp_log` as the single timestamp source, parsed via `OffsetDateTime` | Use the nested `utcTime`/`time` fields inside `body_completo` | Those vary in format (epoch seconds vs. compact strings) by message family; `timestamp_log` is uniform across all 100 rows |
+| Native id (`body_completo.id`/`alarmId`) preferred over hash, when present | Always hash | Real native ids exist for 26/100 rows and are verified unique; preferring them over a hash is more faithful to the source system's own identity |
+| Blank `did` → fallback to `body_completo.deviceId` → `"UNKNOWN"` | Reject the row at ingestion | Demonstrates RT04 tolerance on real, mildly inconsistent data rather than silently dropping 2 real rows |
+| DLQ demo via 4 appended synthetic rows, clearly labeled | Force a failure into a real row; only cover DLQ in the integration test | The case explicitly allows adding events beyond the original 100; a labeled synthetic row keeps the real dataset unmodified and still demonstrates retry/DLQ live via `docker compose` |
+| Two independent domains (`device`, `audit`) | One domain covering ingestion+processing+audit | Unchanged rationale: audit is one of potentially several independent consumers of the event stream |
 
-## 10. Out of scope
+## 13. Out of scope
 
-- The frontend for viewing audits (mentioned by the user as a future, separate project).
-- The real CSV dataset (not yet provided) — the sample CSV and `CsvEventSourceAdapter` are the seam to swap when it arrives.
-- Authentication/authorization on the REST endpoints (not required by the case).
-- Automated DLQ replay (covered as a design discussion in Bloco B, not implemented).
+- The frontend for viewing audits (future, separate project).
+- Authentication/authorization on the REST endpoints.
+- Automated DLQ replay (discussed in `ARCHITECTURE.md`, not implemented).
