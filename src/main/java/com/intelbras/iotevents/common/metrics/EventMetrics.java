@@ -1,11 +1,12 @@
 package com.intelbras.iotevents.common.metrics;
 
+import com.intelbras.iotevents.domains.audit.core.port.MetricsPort;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Component;
 
 @Component
-public class EventMetrics {
+public class EventMetrics implements MetricsPort {
 
     private final Counter processedCounter;
     private final Counter duplicateCounter;
@@ -20,14 +21,17 @@ public class EventMetrics {
             .description("Number of device events sent to a dead-letter topic").register(registry);
     }
 
+    @Override
     public void incrementProcessed() {
         processedCounter.increment();
     }
 
+    @Override
     public void incrementDuplicate() {
         duplicateCounter.increment();
     }
 
+    @Override
     public void incrementDlq() {
         dlqCounter.increment();
     }

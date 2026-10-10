@@ -1,7 +1,6 @@
 package com.intelbras.iotevents.domains.audit.core.usecase;
 
 import com.intelbras.iotevents.common.logging.ExecutionLog;
-import com.intelbras.iotevents.common.metrics.EventMetrics;
 import com.intelbras.iotevents.domains.audit.core.AuditRecord;
 import com.intelbras.iotevents.domains.audit.core.IncomingDeviceEvent;
 import com.intelbras.iotevents.domains.audit.core.KafkaMessageContext;
@@ -9,6 +8,7 @@ import com.intelbras.iotevents.domains.audit.core.error.SimulatedProcessingFailu
 import com.intelbras.iotevents.domains.audit.core.handler.DeviceEventAuditHandler;
 import com.intelbras.iotevents.domains.audit.core.handler.OtherEventAuditHandler;
 import com.intelbras.iotevents.domains.audit.core.port.AuditRepositoryPort;
+import com.intelbras.iotevents.domains.audit.core.port.MetricsPort;
 
 import java.util.List;
 import java.util.Map;
@@ -18,16 +18,16 @@ public class RecordDeviceEventAuditUseCase {
     private final AuditRepositoryPort auditRepositoryPort;
     private final List<DeviceEventAuditHandler> handlers;
     private final OtherEventAuditHandler fallbackHandler;
-    private final EventMetrics eventMetrics;
+    private final MetricsPort metricsPort;
 
     public RecordDeviceEventAuditUseCase(AuditRepositoryPort auditRepositoryPort,
                                           List<DeviceEventAuditHandler> handlers,
                                           OtherEventAuditHandler fallbackHandler,
-                                          EventMetrics eventMetrics) {
+                                          MetricsPort metricsPort) {
         this.auditRepositoryPort = auditRepositoryPort;
         this.handlers = handlers;
         this.fallbackHandler = fallbackHandler;
-        this.eventMetrics = eventMetrics;
+        this.metricsPort = metricsPort;
     }
 
     public void execute(IncomingDeviceEvent event, KafkaMessageContext kafkaCtx) {
@@ -46,7 +46,7 @@ public class RecordDeviceEventAuditUseCase {
             log.step("Checked dedup key against audit store", Map.of("isDuplicate", duplicate));
 
             if (duplicate) {
-                eventMetrics.incrementDuplicate();
+                metricsPort.incrementDuplicate();
                 log.step("Skipped processing because event is a duplicate");
                 log.info("Skipped duplicate device event");
                 return;
@@ -62,7 +62,7 @@ public class RecordDeviceEventAuditUseCase {
             log.step("Built general info via " + handler.getClass().getSimpleName(), Map.of("generalInfo", generalInfo));
 
             auditRepositoryPort.save(AuditRecord.processedNow(event, generalInfo));
-            eventMetrics.incrementProcessed();
+            metricsPort.incrementProcessed();
             log.step("Persisted audit record");
 
             log.info("Processed device event");

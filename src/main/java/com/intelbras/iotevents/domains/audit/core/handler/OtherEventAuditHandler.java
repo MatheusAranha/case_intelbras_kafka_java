@@ -1,9 +1,7 @@
 package com.intelbras.iotevents.domains.audit.core.handler;
 
 import com.intelbras.iotevents.domains.audit.core.IncomingDeviceEvent;
-import org.springframework.stereotype.Component;
 
-@Component
 public class OtherEventAuditHandler implements DeviceEventAuditHandler {
 
     @Override
