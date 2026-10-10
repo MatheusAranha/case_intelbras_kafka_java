@@ -25,6 +25,9 @@ public class KafkaErrorHandlingConfig {
         ExponentialBackOff backOff = new ExponentialBackOff(1000L, 2.0);
         backOff.setMaxAttempts(3);
 
-        return new DefaultErrorHandler(recoverer, backOff);
+        DefaultErrorHandler errorHandler = new DefaultErrorHandler(recoverer, backOff);
+        // A malformed message can never succeed on retry — skip straight to the dead-letter topic.
+        errorHandler.addNotRetryableExceptions(IllegalArgumentException.class);
+        return errorHandler;
     }
 }

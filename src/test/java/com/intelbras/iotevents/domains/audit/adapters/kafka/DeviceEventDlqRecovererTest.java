@@ -20,19 +20,26 @@ import static org.mockito.Mockito.verify;
 class DeviceEventDlqRecovererTest {
 
     private ListAppender<ILoggingEvent> appender;
-    private Logger rootLogger;
+    private Logger targetLogger;
 
     @BeforeEach
     void attachAppender() {
         appender = new ListAppender<>();
         appender.start();
-        rootLogger = (Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME);
-        rootLogger.addAppender(appender);
+        targetLogger = (Logger) LoggerFactory.getLogger(DeviceEventDlqRecoverer.class);
+        targetLogger.addAppender(appender);
     }
 
     @AfterEach
     void detachAppender() {
-        rootLogger.detachAppender(appender);
+        targetLogger.detachAppender(appender);
+    }
+
+    @Test
+    void shouldNotCaptureLogLinesFromUnrelatedLoggers() {
+        LoggerFactory.getLogger("some.totally.unrelated.Logger").info("noise from an unrelated component");
+
+        assertThat(appender.list).isEmpty();
     }
 
     @Test

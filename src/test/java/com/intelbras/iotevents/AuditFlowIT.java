@@ -7,15 +7,19 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.search.MeterNotFoundException;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -38,6 +42,7 @@ import static org.awaitility.Awaitility.await;
 @ActiveProfiles("test")
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class AuditFlowIT {
 
     @Container
@@ -57,6 +62,9 @@ class AuditFlowIT {
 
     @LocalServerPort
     private int port;
+
+    @Autowired
+    private MeterRegistry meterRegistry;
 
     private final TestRestTemplate restTemplate = new TestRestTemplate();
 
@@ -82,12 +90,15 @@ class AuditFlowIT {
 
     @Test
     @Order(2)
-    void shouldNotGrowTheAuditTableWhenTheSameEventsAreIngestedTwice() {
+    void shouldSkipDuplicatesWithoutGrowingTheAuditTableOrReprocessingThem() {
+        double duplicatesBeforeReingestion = readCounterMetric("device_events_duplicate_total");
+
         restTemplate.postForEntity("http://localhost:" + port + "/events/simulate", null, Map.class);
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             ResponseEntity<List> audits = restTemplate.getForEntity("http://localhost:" + port + "/audits", List.class);
             assertThat(audits.getBody()).hasSize(100);
+            assertThat(readCounterMetric("device_events_duplicate_total")).isEqualTo(duplicatesBeforeReingestion + 100);
         });
 
         restTemplate.postForEntity("http://localhost:" + port + "/events/simulate", null, Map.class);
@@ -95,7 +106,16 @@ class AuditFlowIT {
         await().pollDelay(Duration.ofSeconds(5)).atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
             ResponseEntity<List> audits = restTemplate.getForEntity("http://localhost:" + port + "/audits", List.class);
             assertThat(audits.getBody()).hasSize(100);
+            assertThat(readCounterMetric("device_events_duplicate_total")).isEqualTo(duplicatesBeforeReingestion + 200);
         });
+    }
+
+    private double readCounterMetric(String metricName) {
+        try {
+            return meterRegistry.get(metricName).counter().count();
+        } catch (MeterNotFoundException notRegisteredYet) {
+            return 0.0;
+        }
     }
 
     private List<ConsumerRecord<String, String>> consumeFromDlt(String topic) {

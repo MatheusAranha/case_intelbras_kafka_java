@@ -15,19 +15,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ExecutionLogTest {
 
     private ListAppender<ILoggingEvent> appender;
-    private Logger rootLogger;
+    private Logger targetLogger;
 
     @BeforeEach
     void attachAppender() {
         appender = new ListAppender<>();
         appender.start();
-        rootLogger = (Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME);
-        rootLogger.addAppender(appender);
+        targetLogger = (Logger) LoggerFactory.getLogger(ExecutionLogTest.class);
+        targetLogger.addAppender(appender);
     }
 
     @AfterEach
     void detachAppender() {
-        rootLogger.detachAppender(appender);
+        targetLogger.detachAppender(appender);
     }
 
     @Test
@@ -50,5 +50,12 @@ class ExecutionLogTest {
 
         assertThat(appender.list).hasSize(1);
         assertThat(appender.list.get(0).getFormattedMessage()).contains("Failed", "evt-2");
+    }
+
+    @Test
+    void shouldNotCaptureLogLinesFromUnrelatedLoggers() {
+        LoggerFactory.getLogger("some.totally.unrelated.Logger").info("noise from an unrelated component");
+
+        assertThat(appender.list).isEmpty();
     }
 }

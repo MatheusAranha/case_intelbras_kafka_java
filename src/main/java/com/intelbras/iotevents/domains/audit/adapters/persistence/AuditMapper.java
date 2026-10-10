@@ -9,11 +9,12 @@ public final class AuditMapper {
 
     public static AuditJpaEntity toEntity(AuditRecord record) {
         return new AuditJpaEntity(record.dedupKey(), record.deviceId(), record.eventCategory(), record.eventType(),
-            record.generalInfo(), record.consumedAt(), record.createdAt());
+            record.eventTimestamp(), record.generalInfo(), record.consumedAt(), record.createdAt());
     }
 
     public static AuditRecord toDomain(AuditJpaEntity entity) {
         return new AuditRecord(entity.getEventId(), entity.getDeviceId(), entity.getEventCategory(),
-            entity.getEventType(), entity.getGeneralInfo(), entity.getConsumedAt(), entity.getCreatedAt());
+            entity.getEventType(), entity.getEventTimestamp(), entity.getGeneralInfo(), entity.getConsumedAt(),
+            entity.getCreatedAt());
     }
 }
