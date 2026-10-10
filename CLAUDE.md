@@ -273,3 +273,4 @@ public void execute(IncomingDeviceEvent event, KafkaMessageContext kafkaCtx) {
 - Merge into `main` once validated — prefer a regular merge (or squash if the branch has noisy intermediate commits) over leaving work stacked on feature branches.
 - Conventional commit style: `{type}: {description}` (no ticket scope — this is a single-track case project). Types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`, `perf`, `build`, `ci`.
 - Keep commits scoped to one logical change; avoid bundling unrelated domains in one commit.
+- **Commit messages contain only the message itself** — no `Co-Authored-By` or other trailer lines.
