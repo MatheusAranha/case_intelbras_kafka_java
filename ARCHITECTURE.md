@@ -1,4 +1,4 @@
-# Architecture (Bloco B)
+# Architecture
 
 ## Diagram
 

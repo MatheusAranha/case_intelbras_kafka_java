@@ -1,4 +1,4 @@
-# Technical Decisions & Trade-offs (Bloco C)
+# Technical Decisions & Trade-offs
 
 | Decision | Alternative considered | Why this way |
 |---|---|---|
