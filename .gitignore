@@ -25,3 +25,6 @@ replay_pid*
 
 # Case brief material (not meant to be committed to the submission repo)
 case_information/
+
+# superpowers plan execution scratch workspace
+.superpowers/
