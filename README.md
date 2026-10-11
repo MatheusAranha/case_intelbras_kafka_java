@@ -339,6 +339,45 @@ pointed at `localhost:9092`, topic `device.property-change.events.DLT` (and the 
 three `.DLT` topics), to see the raw messages — but this isn't necessary to validate
 the behavior, the metric already proves it.
 
+### Step 7b — Live demo: the random event stream
+
+Beyond the one-shot CSV replay, the app can generate and publish random synthetic
+events continuously, at a rate you control — useful for showing the pipeline handling
+live, varied traffic, or for deliberately pushing past the consumer's current capacity
+to show Kafka consumer lag grow (and later, scaling the consumer making it recover).
+
+Start it:
+
+```bash
+curl -X POST http://localhost:8080/events/random-stream/start \
+  -H "Content-Type: application/json" \
+  -d '{"eventsPerMinute": 600, "dlqRate": 0.05, "duplicateRate": 0.1}'
+```
+
+`eventsPerMinute` is required; `dlqRate`/`duplicateRate` (0–1, default 0) control what
+fraction of generated events are forced to fail (dead-lettered) or replay a previous
+event (a true duplicate). `categories` is optional and defaults to all four. There is
+**no rate cap** — this is also a load-testing tool. Calling `start` again replaces
+whatever was running with the new configuration.
+
+Check progress:
+
+```bash
+curl http://localhost:8080/events/random-stream/status
+```
+
+Generated events use device ids prefixed `RANDOM-` (vs. the CSV's `DEVICE-...` and
+`SYNTHETIC-DLQ-...`), so you can tell them apart in `/audits` or in Grafana. Watch the
+"Random Stream: Requested vs Published" panel — those two lines tracking closely means
+the producer is keeping up; watch the "Kafka Consumer Lag" panel to see the consumer
+fall behind at high rates.
+
+Stop it:
+
+```bash
+curl -X POST http://localhost:8080/events/random-stream/stop
+```
+
 ### Step 8 — Run the tests locally
 
 This requires Java 21, Maven, and Docker running (the test suite includes a
@@ -384,4 +423,7 @@ completely fresh (empty audit trail, as if this were the first run ever).
 - **REST API**:
   - `POST /events/simulate` — reads the bundled dataset, publishes every row to Kafka. Returns `{"publishedCount": <int>}`.
   - `GET /audits?deviceId=&eventType=&from=&to=` — queries the audit trail. All parameters optional; `from`/`to` are ISO-8601 instants, filtered on each event's own timestamp.
+  - `POST /events/random-stream/start` — body: `{eventsPerMinute, dlqRate?, duplicateRate?, categories?}`. Starts (or replaces) the continuous random event publisher.
+  - `POST /events/random-stream/stop` — stops it.
+  - `GET /events/random-stream/status` — current config and requested/published counts.
   - `GET /actuator/health`, `GET /actuator/prometheus` — standard Spring Boot Actuator endpoints.
