@@ -1,5 +1,6 @@
 package com.intelbras.iotevents.domains.device;
 
+import com.intelbras.iotevents.domains.device.core.RandomDeviceEventFactory;
 import com.intelbras.iotevents.domains.device.core.port.EventPublisherPort;
 import com.intelbras.iotevents.domains.device.core.port.EventSourcePort;
 import com.intelbras.iotevents.domains.device.core.port.RandomEventStreamPort;
@@ -17,6 +18,11 @@ public class DeviceUseCaseConfig {
     public SimulateIngestionUseCase simulateIngestionUseCase(EventSourcePort eventSourcePort,
                                                                EventPublisherPort eventPublisherPort) {
         return new SimulateIngestionUseCase(eventSourcePort, eventPublisherPort);
+    }
+
+    @Bean
+    public RandomDeviceEventFactory randomDeviceEventFactory() {
+        return new RandomDeviceEventFactory();
     }
 
     @Bean
