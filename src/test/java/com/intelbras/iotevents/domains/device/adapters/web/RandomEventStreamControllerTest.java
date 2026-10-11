@@ -67,6 +67,14 @@ class RandomEventStreamControllerTest {
     }
 
     @Test
+    void startShouldReturn400ForAnExplicitlyEmptyCategoriesList() throws Exception {
+        mockMvc.perform(post("/events/random-stream/start")
+                .contentType("application/json")
+                .content("{\"eventsPerMinute\":60,\"categories\":[]}"))
+            .andExpect(status().isBadRequest());
+    }
+
+    @Test
     void stopShouldReturnTheResultingStatus() throws Exception {
         when(stopUseCase.execute()).thenReturn(new RandomEventStreamStatus(false, null, null, 5, 5));
 

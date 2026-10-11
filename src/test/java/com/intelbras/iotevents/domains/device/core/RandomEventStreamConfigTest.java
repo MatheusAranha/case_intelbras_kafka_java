@@ -2,6 +2,7 @@ package com.intelbras.iotevents.domains.device.core;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -38,6 +39,12 @@ class RandomEventStreamConfigTest {
         assertThatThrownBy(() -> new RandomEventStreamConfig(60, 0.0, 0.0, List.of()))
             .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new RandomEventStreamConfig(60, 0.0, 0.0, null))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldRejectCategoriesContainingNullEntries() {
+        assertThatThrownBy(() -> new RandomEventStreamConfig(60, 0.0, 0.0, Arrays.asList(EventCategory.OTHER, null)))
             .isInstanceOf(IllegalArgumentException.class);
     }
 }

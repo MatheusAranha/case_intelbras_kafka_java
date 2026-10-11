@@ -1,6 +1,7 @@
 package com.intelbras.iotevents.domains.device.adapters.stream;
 
 import com.intelbras.iotevents.common.logging.ExecutionLog;
+import jakarta.annotation.PreDestroy;
 import com.intelbras.iotevents.domains.device.core.DeviceEvent;
 import com.intelbras.iotevents.domains.device.core.EventCategory;
 import com.intelbras.iotevents.domains.device.core.RandomDeviceEventFactory;
@@ -103,6 +104,13 @@ public class RandomEventStreamScheduler implements RandomEventStreamPort {
         }
     }
 
+    @PreDestroy
+    public void shutdown() {
+        synchronized (lock) {
+            stopInternal();
+        }
+    }
+
     private void stopInternal() {
         if (tickExecutor != null) {
             tickExecutor.shutdownNow();
@@ -167,10 +175,15 @@ public class RandomEventStreamScheduler implements RandomEventStreamPort {
         EventCategory category = categories.get(rnd.nextInt(categories.size()));
         boolean forceDlq = rnd.nextDouble() < cfg.dlqRate();
         DeviceEvent event = factory.generate(category, forceDlq);
-        synchronized (lock) {
-            history.addLast(event);
-            while (history.size() > HISTORY_LIMIT) {
-                history.removeFirst();
+        if (!forceDlq) {
+            // A forced-DLQ event never gets an audit row, so replaying it later wouldn't
+            // hit the dedup path — it would just dead-letter again, which isn't what a
+            // "duplicate" is supposed to exercise (spec: a replay is never also forced-DLQ).
+            synchronized (lock) {
+                history.addLast(event);
+                while (history.size() > HISTORY_LIMIT) {
+                    history.removeFirst();
+                }
             }
         }
         return event;
