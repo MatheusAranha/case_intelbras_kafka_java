@@ -35,7 +35,7 @@ public class RandomEventStreamController {
 
     @PostMapping("/start")
     public ResponseEntity<RandomEventStreamStatus> start(@RequestBody StartRandomEventStreamRequest request) {
-        List<EventCategory> categories = (request.categories() == null || request.categories().isEmpty())
+        List<EventCategory> categories = request.categories() == null
             ? List.of(EventCategory.values())
             : request.categories();
         double eventsPerMinute = request.eventsPerMinute() == null ? 0 : request.eventsPerMinute();

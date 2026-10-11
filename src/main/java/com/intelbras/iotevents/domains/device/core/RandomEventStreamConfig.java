@@ -18,5 +18,8 @@ public record RandomEventStreamConfig(double eventsPerMinute, double dlqRate, do
         if (categories == null || categories.isEmpty()) {
             throw new IllegalArgumentException("categories must not be empty");
         }
+        if (categories.stream().anyMatch(category -> category == null)) {
+            throw new IllegalArgumentException("categories must not contain null entries");
+        }
     }
 }

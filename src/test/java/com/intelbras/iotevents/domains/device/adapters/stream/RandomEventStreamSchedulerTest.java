@@ -84,6 +84,21 @@ class RandomEventStreamSchedulerTest {
     }
 
     @Test
+    void decideEventShouldNeverReplayAForcedDlqEvent() {
+        RandomEventStreamScheduler scheduler = new RandomEventStreamScheduler(
+            mock(EventPublisherPort.class), new RandomDeviceEventFactory(new Random(5)), mock(RandomStreamMetricsPort.class));
+        RandomEventStreamConfig dlqConfig = new RandomEventStreamConfig(600, 1.0, 0.0, List.of(EventCategory.PROPERTY_CHANGE));
+        RandomEventStreamConfig replayConfig = new RandomEventStreamConfig(600, 0.0, 1.0, List.of(EventCategory.PROPERTY_CHANGE));
+
+        DeviceEvent forcedDlqEvent = scheduler.decideEvent(dlqConfig, new Random(1));
+        assertThat(forcedDlqEvent.payload()).containsEntry("simulateFailure", true);
+
+        DeviceEvent next = scheduler.decideEvent(replayConfig, new Random(1));
+
+        assertThat(next.payload()).doesNotContainKey("simulateFailure");
+    }
+
+    @Test
     void statusBeforeEverStartingShouldBeSafelyNotRunning() {
         RandomEventStreamScheduler scheduler = new RandomEventStreamScheduler(
             mock(EventPublisherPort.class), new RandomDeviceEventFactory(), mock(RandomStreamMetricsPort.class));
@@ -151,6 +166,19 @@ class RandomEventStreamSchedulerTest {
         verify(publisherPort, timeout(2000).atLeastOnce()).publish(any(DeviceEvent.class));
 
         scheduler.stop();
+    }
+
+    @Test
+    void shutdownShouldStopARunningStream() {
+        EventPublisherPort publisherPort = mock(EventPublisherPort.class);
+        RandomEventStreamScheduler scheduler = new RandomEventStreamScheduler(
+            publisherPort, new RandomDeviceEventFactory(), mock(RandomStreamMetricsPort.class));
+        RandomEventStreamConfig config = new RandomEventStreamConfig(60, 0.0, 0.0, List.of(EventCategory.PROPERTY_CHANGE));
+        scheduler.start(config);
+
+        scheduler.shutdown();
+
+        assertThat(scheduler.status().running()).isFalse();
     }
 
     @Test

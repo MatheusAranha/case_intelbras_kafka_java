@@ -1,10 +1,13 @@
 package com.intelbras.iotevents;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.search.MeterNotFoundException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -52,6 +55,9 @@ class RandomEventStreamFlowIT {
     @LocalServerPort
     private int port;
 
+    @Autowired
+    private MeterRegistry meterRegistry;
+
     private final TestRestTemplate restTemplate = new TestRestTemplate();
 
     @AfterEach
@@ -79,27 +85,48 @@ class RandomEventStreamFlowIT {
     void duplicateRateOfOneShouldMakeAuditCountGrowSlowerThanRequestedCount() {
         ResponseEntity<List> auditsBefore = restTemplate.getForEntity("http://localhost:" + port + "/audits", List.class);
         int auditCountBefore = auditsBefore.getBody().size();
+        double duplicatesBefore = readCounterMetric("device_events_duplicate_total");
 
         Map<String, Object> body = Map.of("eventsPerMinute", 3000, "dlqRate", 0.0, "duplicateRate", 1.0);
         restTemplate.postForEntity(url("/start"), body, Map.class);
 
+        // Confirm at least one fresh event really landed as an audit row before judging
+        // anything about growth staying slow — otherwise "growth < requested" could pass
+        // trivially just because the consumer hasn't caught up yet.
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            ResponseEntity<List> audits = restTemplate.getForEntity("http://localhost:" + port + "/audits", List.class);
+            assertThat(audits.getBody().size()).isGreaterThan(auditCountBefore);
+        });
+
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
             ResponseEntity<Map> status = restTemplate.getForEntity(url("/status"), Map.class);
             Number requested = (Number) status.getBody().get("requestedCount");
-            assertThat(requested.longValue()).isGreaterThan(20);
+            assertThat(requested.longValue()).isGreaterThan(100);
         });
 
         ResponseEntity<Map> stopResponse = restTemplate.postForEntity(url("/stop"), null, Map.class);
         long requested = ((Number) stopResponse.getBody().get("requestedCount")).longValue();
 
-        // duplicateRate=1.0 means only the very first event this stream ever generates is
-        // fresh; every later dispatch replays that same eventId, so the audit table (which
-        // dedupes by eventId) should grow by about 1 row no matter how many were requested.
+        // duplicateRate=1.0 means history starts empty, so the handful of workers dispatched
+        // on the very first tick (bounded by eventsPerMinute/600) may each independently see
+        // an empty history and generate a fresh event; every dispatch after that always
+        // replays one of those few, so audit growth should stay small and well under
+        // requested no matter how long the stream kept running.
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
             ResponseEntity<List> auditsAfter = restTemplate.getForEntity("http://localhost:" + port + "/audits", List.class);
             long auditGrowth = auditsAfter.getBody().size() - auditCountBefore;
+            assertThat(auditGrowth).isLessThanOrEqualTo(10);
             assertThat(auditGrowth).isLessThan(requested);
+            assertThat(readCounterMetric("device_events_duplicate_total")).isGreaterThan(duplicatesBefore);
         });
+    }
+
+    private double readCounterMetric(String metricName) {
+        try {
+            return meterRegistry.get(metricName).counter().count();
+        } catch (MeterNotFoundException notRegisteredYet) {
+            return 0.0;
+        }
     }
 
     private String url(String path) {
