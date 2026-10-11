@@ -10,6 +10,11 @@
     {"id": 3, "title": "Dead-lettered Events (rate)", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
      "targets": [{"expr": "rate(device_events_dlq_total[1m])", "legendFormat": "dlq"}]},
     {"id": 4, "title": "Kafka Consumer Lag", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
-     "targets": [{"expr": "sum(kafka_consumer_fetch_manager_records_lag) by (topic)", "legendFormat": "{{topic}}"}]}
+     "targets": [{"expr": "sum(kafka_consumer_fetch_manager_records_lag) by (topic)", "legendFormat": "{{topic}}"}]},
+    {"id": 5, "title": "Random Stream: Requested vs Published (rate)", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+     "targets": [
+       {"expr": "rate(random_stream_requested_total[1m])", "legendFormat": "requested"},
+       {"expr": "rate(random_stream_published_total[1m])", "legendFormat": "published"}
+     ]}
   ]
 }
