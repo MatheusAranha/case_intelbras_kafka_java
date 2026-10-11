@@ -121,8 +121,31 @@ every expected output is what you should actually see.
   If either command fails, install Docker from https://www.docker.com/get-started/
   and make sure the Docker daemon is running before continuing.
 - **Java 21** and **Maven** — only needed if you want to run the tests *outside*
-  Docker (Part 2, Step 6). Not needed just to run the app itself, since Docker builds
-  it for you. Check with `java -version` (should say `21`) and `mvn -version`.
+  Docker (Step 8). Not needed just to run the app itself, since Docker builds it for
+  you. Check with `java -version` (should say `21`) and `mvn -version`.
+
+  If you don't have them yet, the easiest cross-platform way is
+  [SDKMAN](https://sdkman.io):
+  ```bash
+  curl -s "https://get.sdkman.io" | bash
+  source "$HOME/.sdkman/bin/sdkman-init.sh"
+  sdk install java 21.0.4-tem
+  sdk install maven
+  ```
+  Or with a platform package manager: `brew install openjdk@21 maven` (macOS),
+  `sudo apt install openjdk-21-jdk maven` (Ubuntu/Debian), or
+  `choco install openjdk maven` (Windows, via Chocolatey).
+
+  **Project (Maven) dependencies are a separate thing from Java/Maven themselves** —
+  there's no `npm install`-style step for them. Maven downloads everything declared in
+  `pom.xml` automatically into `~/.m2/repository` the first time you build or test, and
+  caches it for every build after that. If you want to pre-download them without
+  compiling or testing anything yet, run:
+  ```bash
+  mvn dependency:resolve
+  ```
+  Otherwise, just running `./test.sh` (Step 8) or `mvn test` downloads whatever's
+  missing as part of the normal run.
 - A terminal, and `curl` (preinstalled on macOS/Linux; on Windows use Git Bash, WSL,
   or PowerShell's `curl.exe`).
 
