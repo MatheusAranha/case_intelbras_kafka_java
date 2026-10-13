@@ -27,7 +27,8 @@ flowchart LR
 
     UC -->|duplicate| LOG1[log only]
     UC -->|success| DB[(Postgres audit_records)]
-    UC -->|exhausted retries| DLT[per-topic .DLT]
+    UC -->|throws| EH[DefaultErrorHandler<br/>3 retries, 1s/2s/4s]
+    EH -->|exhausted retries| DLT[per-topic .DLT]
 
     DB --> API[GET /audits]
 ```
