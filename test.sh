@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs the full test suite locally: unit tests plus AuditFlowIT, a
-# Testcontainers integration test that spins up real Kafka and Postgres
+# Runs the full test suite locally: unit tests plus AuditFlowIT and
+# RandomEventStreamFlowIT, Testcontainers integration tests that spin up real Kafka and Postgres
 # containers (separate from run.sh's docker-compose stack).
 set -euo pipefail
 
@@ -21,12 +21,12 @@ echo "    $(mvn -version | head -1)"
 
 if ! docker info >/dev/null 2>&1; then
   echo "ERROR: Docker is not running."
-  echo "The integration test (AuditFlowIT) needs it to start real Kafka and Postgres"
+  echo "The integration tests (AuditFlowIT, RandomEventStreamFlowIT) need it to start real Kafka and Postgres"
   echo "containers. Start Docker and re-run this script."
   exit 1
 fi
 
 echo "    Docker is running."
 
-echo "==> Running the full test suite (unit tests + Testcontainers integration test)"
+echo "==> Running the full test suite (unit tests + Testcontainers integration tests)"
 mvn test
