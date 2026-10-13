@@ -67,12 +67,49 @@ scale. At millions-of-events/day scale, partition count would grow per topic bas
 observed throughput and target consumer parallelism; `PROPERTY_CHANGE` (45% of this
 sample) would likely need more partitions than `OTHER` (10%).
 
+**Sizing math.** "Millions of events/day" divided across 86,400 seconds/day is deceptively
+modest on average — 1,000,000/day ≈ 11.6 events/sec, 5,000,000/day ≈ 58 events/sec — but
+IoT traffic is bursty (mass firmware rollouts, outage recovery floods), so design for
+peaks 5–10× the daily average, not the average itself. Partition count is the hard
+ceiling on consumer parallelism per topic, and increasing it later (recreating the topic
+is the only way to decrease it) means re-keying and a rebalance, so it's provisioned
+generously up front rather than reactively.
+
+**Producer durability.** Today, `application.yml` sets no producer tuning at all — acks,
+idempotence, batching, and compression all run on whatever Spring Boot and kafka-clients
+default to, not on an explicit decision. In production these would be pinned explicitly:
+`acks=all` and `enable.idempotence=true` (producer-side exactly-once-per-partition,
+pairing with the existing `eventId` dedup for an end-to-end exactly-once effect),
+`linger.ms`/`batch.size` tuned for throughput over per-message latency, and
+`compression.type=lz4` (or `zstd`) to cut network and broker-disk cost at this volume.
+
+**Replication.** `KafkaTopicConfig` hardcodes `replicas(1)` for every topic today — correct
+for this case's single local KRaft broker, but a single point of failure. Production would
+run replication factor 3 with `min.insync.replicas=2`, brokers spread across multiple
+availability zones, so losing a broker (or a whole AZ) doesn't lose acknowledged writes or
+stall producers.
+
+**Hot partitions.** Keying by `deviceId` keeps one device's events in order on one
+partition, but a single very chatty device concentrates all of its own traffic on that
+one partition, capping its throughput at one consumer thread and potentially skewing load
+across the partition set. The usual mitigation — splitting a hot key across several
+partitions via a composite key or salting — trades away exactly the per-device ordering
+guarantee this design relies on, so it's a call made per hot device, not a default.
+
 ## Consumer groups and parallelism
 
 All four listeners share consumer group `audit-service` — one logical consuming
 application across four topics. Concurrency (3, matching partition count) parallelizes
 within each topic. Scaling horizontally means more `audit-service` instances, up to the
 partition-count ceiling per topic.
+
+**Consumer scaling at production volume.** Beyond the per-topic partition-count ceiling,
+extra `audit-service` instances sit idle — Kafka never assigns more than one consumer per
+partition within a group. Rebalancing on instance join/leave briefly pauses affected
+partitions; the cooperative-sticky assignor (vs. the default eager range assignor)
+minimizes that pause by reassigning only the partitions that actually need to move.
+Autoscaling instance count directly off consumer lag (e.g. KEDA's Kafka scaler) turns
+"add capacity when lag grows" into an automated response instead of a manual one.
 
 ## Ordering
 
@@ -89,12 +126,38 @@ for `iotEvent`) when available, else a deterministic SHA-256 hash of
 before processing; a duplicate is logged and skipped. A database-level unique
 constraint on `event_id` backs this up against race conditions.
 
+**Idempotency at scale.** The check-then-insert pattern above is one extra DB round trip
+per event on top of the insert itself — fine at case scale, a real cost at millions/day.
+The usual production fix drops the separate `existsByDedupKey` read entirely and relies
+on the unique constraint with an upsert (`INSERT ... ON CONFLICT DO NOTHING`), turning two
+round trips into one and letting Postgres itself resolve "have I seen this `eventId`"
+instead of racing a read against a concurrent write. Retaining dedup keys forever is also
+unbounded growth — a TTL or archival policy on old `eventId`s (paired with the
+time-based partitioning below) keeps the uniqueness index itself from growing forever.
+
+**Database as a bottleneck.** `audit_records` growing by millions of rows/day needs more
+than a bigger disk: time-based table partitioning (e.g. by day or month) keeps indexes
+small and queries fast; a retention/archival policy (cold storage or deletion past a
+retention window) stops the table from growing forever; batch inserts, instead of one
+`INSERT` per event, cut per-row transaction overhead. `GET /audits` — already unpaginated
+today, called out as a deferred limitation in the README — would need pagination and
+likely a read replica once query load has to share the database with write load at this
+volume.
+
 ## Retry and handling of unprocessable messages
 
 A handler failure retries 3 times with exponential backoff (1s, 2s, 4s). If still
 failing, the record is dead-lettered to `<topic>.DLT` and logged with full context —
 no audit row is written. Replay from a DLT is a deliberate, manual operational action,
 not automated by this application.
+
+**DLT operations in production.** A replay would be a small dedicated consumer, or an
+operational tool (`kafka-console-consumer`/`kcat` piping a `.DLT` topic back into its
+source topic), run deliberately by an operator after investigating why those messages
+failed — never automatic. DLT retention would typically run longer than the main topics'
+(long enough to diagnose and replay) but still bounded. The `DeviceEventsDeadLettered`
+alert (see Observability → Alerts) is what tells an operator a replay might be needed in
+the first place.
 
 ## Observability
 
@@ -131,3 +194,20 @@ real dataset's 2 blank-`did` rows, resolved via a fallback rather than dropped).
 production scale, Kafka replication factor > 1 and multiple `audit-service` instances
 would remove single points of failure (this case's local Kafka is a single-node KRaft
 broker for simplicity).
+
+**Failure scenarios.**
+
+- **Broker down.** With today's replication factor 1, losing the single broker stops all
+  production and consumption outright. With replication factor 3 (see Scalability
+  above), producers and consumers keep working against the remaining brokers.
+- **Postgres down.** `audit`'s handler calls fail, retries exhaust, and today's error
+  handler dead-letters the message — which "works," but is misleading, since the message
+  itself was never the problem, the database was. A better production response detects
+  the DB-down condition (e.g. a connection-pool health check) and pauses the consumer
+  instead of burning through the retry budget and dead-lettering an otherwise-healthy
+  backlog; consumption resumes once Postgres is back.
+- **App crash mid-batch.** Processing is at-least-once — Kafka redelivers any record
+  whose offset wasn't committed — and every write path goes through the same `eventId`
+  dedup check. A crash between consuming a record and committing its offset just means
+  that record gets reprocessed; the dedup check (backed by the DB unique constraint)
+  makes that reprocessing a no-op instead of a duplicate audit row.
