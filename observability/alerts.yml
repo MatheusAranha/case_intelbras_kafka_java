@@ -1,0 +1,63 @@
+groups:
+  - name: iot-events-app
+    rules:
+      - alert: DeviceEventsDeadLettered
+        expr: increase(device_events_dlq_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Device events are being dead-lettered"
+          description: >-
+            {{ $value }} event(s) were dead-lettered in the last 5 minutes.
+            DLT replay is a manual operational action by design — investigate
+            the failing handler or payload before replaying.
+
+      - alert: AuditConsumerLagHigh
+        expr: sum(kafka_consumer_fetch_manager_records_lag) by (topic) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is high on {{ $labels.topic }}"
+          description: >-
+            Consumer lag on topic {{ $labels.topic }} has stayed above 100
+            records for 5 minutes ({{ $value }} records). audit-service is
+            falling behind the producer — consider scaling listener
+            concurrency, partition count, or app instances.
+
+      - alert: RandomStreamPublishGap
+        expr: rate(random_stream_requested_total[1m]) - rate(random_stream_published_total[1m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Random event stream requests are outpacing successful publishes"
+          description: >-
+            requested - published rate has stayed above 0 for 2 minutes.
+            RandomEventStreamScheduler.dispatchOne swallows publish failures
+            without logging them, so this metric gap is the only signal that
+            something is failing on the producer side.
+
+      - alert: IotEventsAppDown
+        expr: up{job="iot-events-app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "iot-events-app is unreachable"
+          description: >-
+            Prometheus has not been able to scrape {{ $labels.instance }}
+            for at least 1 minute.
+
+      - alert: DuplicateRateHigh
+        expr: (rate(device_events_duplicate_total[5m]) / clamp_min(rate(device_events_processed_total[5m]), 1e-9)) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Abnormally high duplicate event rate"
+          description: >-
+            Duplicate events have arrived at over 50% of the processed rate
+            for 5 minutes — upstream may be redelivering or replaying events
+            abnormally.

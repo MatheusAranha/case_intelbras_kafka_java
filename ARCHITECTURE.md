@@ -79,6 +79,25 @@ topic/partition/offset/key context for Kafka-driven behaviours. Metrics
 `device_events_dlq_total`, Kafka consumer lag) are scraped by Prometheus and shown in
 a provisioned Grafana dashboard.
 
+### Alerts
+
+`observability/alerts.yml` defines five Prometheus alerting rules, loaded via
+`rule_files` in `observability/prometheus.yml`, visible at
+`http://localhost:9090/alerts`:
+
+| Alert | Fires when | Why it matters |
+|---|---|---|
+| `DeviceEventsDeadLettered` | any event dead-lettered in the last 5m | DLT replay is manual by design — a human needs to know |
+| `AuditConsumerLagHigh` | per-topic consumer lag > 100 records for 5m | `audit-service` is falling behind the producer |
+| `RandomStreamPublishGap` | `random_stream_requested_total` rate exceeds `random_stream_published_total` rate for 2m | `RandomEventStreamScheduler.dispatchOne` swallows publish failures without logging them, so this gap is the only signal |
+| `IotEventsAppDown` | the app's `/actuator/prometheus` scrape target is down for 1m | Prometheus itself can't reach the app |
+| `DuplicateRateHigh` | duplicate rate exceeds 50% of the processed rate for 5m | upstream may be redelivering or replaying abnormally |
+
+These rules run inside the local Prometheus container only — there is no Alertmanager
+in this stack. In production, Alertmanager (or an equivalent, e.g. a managed Prometheus
+service's built-in alerting) would receive these and route them to on-call, Slack, or
+email with grouping/silencing; wiring that up is out of scope for a local case demo.
+
 ## Availability and fault tolerance
 
 A single bad message never blocks a partition beyond its retry budget. The CSV adapter

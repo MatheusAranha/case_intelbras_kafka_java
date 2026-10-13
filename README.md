@@ -297,6 +297,13 @@ updating in real time as you trigger more ingestions.
 
 Prometheus's own UI (for writing ad-hoc queries) is at **http://localhost:9090**.
 
+**Alerts:** five Prometheus alerting rules (dead-lettered events, high consumer lag,
+the random stream's publish gap, the app being unreachable, an abnormal duplicate
+rate) are pre-loaded — see them at **http://localhost:9090/alerts**. Running the
+standard demo (Step 3, including the 4 synthetic DLQ rows) should make
+`DeviceEventsDeadLettered` fire; that's expected, it's the live demo for that alert.
+Full list and rationale in `ARCHITECTURE.md`'s Observability section.
+
 **Example debugging query:** the random event stream's dispatch loop
 (`RandomEventStreamScheduler.dispatchOne`) deliberately swallows publish failures
 without logging them — a single slot failing must never stop the stream, and
