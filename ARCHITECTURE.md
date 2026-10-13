@@ -73,7 +73,12 @@ IoT traffic is bursty (mass firmware rollouts, outage recovery floods), so desig
 peaks 5–10× the daily average, not the average itself. Partition count is the hard
 ceiling on consumer parallelism per topic, and increasing it later (recreating the topic
 is the only way to decrease it) means re-keying and a rebalance, so it's provisioned
-generously up front rather than reactively.
+generously up front rather than reactively. Mapping that to partitions: at 5M/day peak
+(290–580 ev/sec total), `PROPERTY_CHANGE`'s ~45% share is ~130–260 ev/sec; at roughly
+50–100 ev/sec per consumer thread (one DB round trip per event, see Idempotency below),
+that needs only 2–6 threads to keep up — but partitions would still be provisioned well
+above that bare minimum (e.g. 8–16 for the hottest topic) to leave headroom for threads
+tied up retrying/dead-lettering and for future growth.
 
 **Producer durability.** Today, `application.yml` sets no producer tuning at all — acks,
 idempotence, batching, and compression all run on whatever Spring Boot and kafka-clients
@@ -132,14 +137,19 @@ The usual production fix drops the separate `existsByDedupKey` read entirely and
 on the unique constraint with an upsert (`INSERT ... ON CONFLICT DO NOTHING`), turning two
 round trips into one and letting Postgres itself resolve "have I seen this `eventId`"
 instead of racing a read against a concurrent write. Retaining dedup keys forever is also
-unbounded growth — a TTL or archival policy on old `eventId`s (paired with the
-time-based partitioning below) keeps the uniqueness index itself from growing forever.
+unbounded growth — a TTL or archival policy on old `eventId`s keeps the uniqueness index
+itself from growing forever.
 
 **Database as a bottleneck.** `audit_records` growing by millions of rows/day needs more
-than a bigger disk: time-based table partitioning (e.g. by day or month) keeps indexes
-small and queries fast; a retention/archival policy (cold storage or deletion past a
-retention window) stops the table from growing forever; batch inserts, instead of one
-`INSERT` per event, cut per-row transaction overhead. `GET /audits` — already unpaginated
+than a bigger disk: time-based table partitioning (e.g. by day or month, on the existing
+`event_timestamp` column) keeps indexes small and queries fast; a retention/archival
+policy (cold storage or deletion past a retention window) stops the table from growing
+forever; batch inserts, instead of one `INSERT` per event, cut per-row transaction
+overhead. One wrinkle: Postgres requires a partitioned table's unique constraint to
+include the partition key, so today's `UNIQUE (event_id)` (`V1__create_audit_records_table.sql`)
+can't survive partitioning as written — it would become `UNIQUE (event_id, event_timestamp)`,
+which still catches a true redelivery (same event, same timestamp) without needing a
+separate dedup table. `GET /audits` — already unpaginated
 today, called out as a deferred limitation in the README — would need pagination and
 likely a read replica once query load has to share the database with write load at this
 volume.
@@ -177,7 +187,7 @@ a provisioned Grafana dashboard.
 |---|---|---|
 | `DeviceEventsDeadLettered` | any event dead-lettered in the last 5m | DLT replay is manual by design — a human needs to know |
 | `AuditConsumerLagHigh` | per-topic consumer lag > 100 records for 5m | `audit-service` is falling behind the producer |
-| `RandomStreamPublishGap` | `random_stream_requested_total` rate exceeds `random_stream_published_total` rate for 2m | `RandomEventStreamScheduler.dispatchOne` swallows publish failures without logging them, so this gap is the only signal |
+| `RandomStreamPublishGap` | `random_stream_requested_total` rate exceeds `random_stream_published_total` rate for 2m | `RandomEventStreamScheduler.dispatchOne` swallows the exception so one failing slot never stops the stream; the publisher adapter still logs each failure individually, but nothing aggregates those lines, so this gap is the practical, alertable signal |
 | `IotEventsAppDown` | the app's `/actuator/prometheus` scrape target is down for 1m | Prometheus itself can't reach the app |
 | `DuplicateRateHigh` | duplicate rate exceeds 50% of the processed rate for 5m | upstream may be redelivering or replaying abnormally |
 
