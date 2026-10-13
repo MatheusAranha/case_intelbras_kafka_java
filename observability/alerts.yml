@@ -27,17 +27,22 @@ groups:
             concurrency, partition count, or app instances.
 
       - alert: RandomStreamPublishGap
-        expr: rate(random_stream_requested_total[1m]) - rate(random_stream_published_total[1m]) > 0
+        expr: >-
+          (increase(random_stream_requested_total[5m]) - increase(random_stream_published_total[5m]))
+          / clamp_min(increase(random_stream_requested_total[5m]), 1) > 0.05
         for: 2m
         labels:
           severity: warning
         annotations:
           summary: "Random event stream requests are outpacing successful publishes"
           description: >-
-            requested - published rate has stayed above 0 for 2 minutes.
-            RandomEventStreamScheduler.dispatchOne swallows publish failures
-            without logging them, so this metric gap is the only signal that
-            something is failing on the producer side.
+            Over 5% of requested events in the last 5 minutes were not
+            successfully published. RandomEventStreamScheduler.dispatchOne
+            swallows the exception so one failing slot never stops the
+            stream; the publisher adapter still logs each failure
+            individually, but nothing aggregates those lines, so this ratio
+            is the practical, alertable signal that publishes are failing at
+            more than background noise levels.
 
       - alert: IotEventsAppDown
         expr: up{job="iot-events-app"} == 0

@@ -311,10 +311,12 @@ standard demo (Step 3, including the 4 synthetic DLQ rows) should make
 Full list and rationale in `ARCHITECTURE.md`'s Observability section.
 
 **Example debugging query:** the random event stream's dispatch loop
-(`RandomEventStreamScheduler.dispatchOne`) deliberately swallows publish failures
-without logging them — a single slot failing must never stop the stream, and
-`/status`'s `requestedCount` vs `publishedCount` gap is the intended signal. To watch
-that gap live instead of re-polling `/status`, run this in the Prometheus Graph tab:
+(`RandomEventStreamScheduler.dispatchOne`) deliberately swallows the exception so a
+single failing slot never stops the stream. The publisher adapter still logs each
+individual failure via `ExecutionLog`, but nothing aggregates those lines, so
+`/status`'s `requestedCount` vs `publishedCount` gap is the practical signal for "is
+this actually happening at scale." To watch that gap live instead of re-polling
+`/status`, run this in the Prometheus Graph tab:
 
 ```promql
 rate(random_stream_requested_total[1m]) - rate(random_stream_published_total[1m])
@@ -322,7 +324,8 @@ rate(random_stream_requested_total[1m]) - rate(random_stream_published_total[1m]
 
 A flat line around 0 means every requested event is actually reaching Kafka. A
 sustained positive value means publishes are failing under the hood (producer buffer
-full, broker unreachable, serialization error) with nothing else surfacing it.
+full, broker unreachable, serialization error) — check the app logs for the
+individual `KafkaEventPublisherAdapter` error lines once this signal fires.
 
 ### Step 6 — Prove idempotency (duplicate handling)
 
