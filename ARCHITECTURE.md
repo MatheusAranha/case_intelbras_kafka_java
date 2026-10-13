@@ -10,6 +10,11 @@ flowchart LR
     SIM -->|publish, key=deviceId| T3[device.motion-detection.events]
     SIM -->|publish, key=deviceId| T4[device.other.events]
 
+    RAND[RandomEventStreamScheduler<br/>POST /events/random-stream/start] -->|publish, key=deviceId, any category| T1
+    RAND --> T2
+    RAND --> T3
+    RAND --> T4
+
     T1 --> L1[PropertyChangeEventListener]
     T2 --> L2[StatusChangeEventListener]
     T3 --> L3[MotionDetectionEventListener]
@@ -34,6 +39,26 @@ grouped into the four kinds of event the case brief itself names: `PROPERTY_CHAN
 (`iotProperty`), `STATUS_CHANGE` (`online`/`offline`), `MOTION_DETECTION`
 (`videoMotion`/`mobileDetect`/`human`/`smartVideoMotion`), `OTHER` (everything else,
 including any future unrecognized `msgType`).
+
+## Load generation: random event stream
+
+Beyond the one-shot CSV replay, `POST /events/random-stream/start` runs a background
+`RandomEventStreamScheduler` that fabricates and publishes synthetic events at a
+caller-chosen rate (events/minute), with no upper cap. It reuses the exact
+publish → consume → audit path unchanged — same topics, same listeners, same
+`EventPublisherPort` — nothing on the consumer side knows the difference between a
+CSV-sourced event and a generated one. Generated devices are prefixed `RANDOM-` so
+they're distinguishable in `/audits` and Grafana from the CSV demo's `DEVICE-...`/
+`SYNTHETIC-DLQ-...` rows.
+
+Its purpose is deliberately adversarial to the consumer side: push past
+`audit-service`'s current capacity, watch Kafka consumer lag grow on the existing
+Grafana dashboard and the `AuditConsumerLagHigh` alert, then demonstrate that scaling
+the consumer (listener concurrency, partition count, more app instances) makes that
+lag recover. `dlqRate`/`duplicateRate` (0–1, independently rolled per generated event)
+let the same demo also exercise the retry/DLQ path and the dedup path on demand,
+instead of relying only on the CSV's 4 fixed synthetic rows. Full design rationale in
+`docs/superpowers/specs/2026-10-11-random-event-stream-design.md`.
 
 ## Scalability and Kafka partitioning strategy
 
