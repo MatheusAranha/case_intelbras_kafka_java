@@ -458,3 +458,6 @@ completely fresh (empty audit trail, as if this were the first run ever).
   - `POST /events/random-stream/stop` — stops it.
   - `GET /events/random-stream/status` — current config and requested/published counts.
   - `GET /actuator/health`, `GET /actuator/prometheus` — standard Spring Boot Actuator endpoints.
+- **Scaling knobs** (environment variables, set on the `app` service in `docker-compose.yml`):
+  - `KAFKA_TOPIC_PARTITIONS` (default `3`) — partitions per main topic. It can only grow; increasing it remaps `deviceId` keys.
+  - `KAFKA_LISTENER_CONCURRENCY` (default `3`) — consumer threads per listener. Threads beyond the partition count sit idle.

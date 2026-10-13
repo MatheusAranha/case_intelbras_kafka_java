@@ -9,7 +9,6 @@ public final class KafkaTopics {
     public static final String DEVICE_MOTION_DETECTION_EVENTS = "device.motion-detection.events";
     public static final String DEVICE_OTHER_EVENTS = "device.other.events";
     public static final String DLT_SUFFIX = ".DLT";
-    public static final int PARTITIONS = 3;
     public static final int DLT_PARTITIONS = 1;
     public static final String CONSUMER_GROUP = "audit-service";
 

@@ -1,12 +1,19 @@
 package com.intelbras.iotevents.config;
 
 import org.apache.kafka.clients.admin.NewTopic;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.TopicBuilder;
 
 @Configuration
 public class KafkaTopicConfig {
+
+    private final int topicPartitions;
+
+    public KafkaTopicConfig(@Value("${app.kafka.topic-partitions}") int topicPartitions) {
+        this.topicPartitions = topicPartitions;
+    }
 
     @Bean
     public NewTopic devicePropertyChangeEventsTopic() {
@@ -49,7 +56,7 @@ public class KafkaTopicConfig {
     }
 
     private NewTopic topic(String name) {
-        return TopicBuilder.name(name).partitions(KafkaTopics.PARTITIONS).replicas(1).build();
+        return TopicBuilder.name(name).partitions(topicPartitions).replicas(1).build();
     }
 
     private NewTopic dlt(String baseTopicName) {

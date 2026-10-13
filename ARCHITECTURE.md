@@ -108,6 +108,12 @@ application across four topics. Concurrency (3, matching partition count) parall
 within each topic. Scaling horizontally means more `audit-service` instances, up to the
 partition-count ceiling per topic.
 
+Both numbers are configuration, not code: `KAFKA_TOPIC_PARTITIONS` (default 3) sets the
+partition count of the four main topics, and `KAFKA_LISTENER_CONCURRENCY` (default 3)
+sets consumer threads per listener per instance. Raising partitions on an existing
+topic adds partitions in place (Kafka can't remove them), which remaps `deviceId` keys,
+so per-device ordering is only guaranteed for events produced after the change.
+
 **Consumer scaling at production volume.** Beyond the per-topic partition-count ceiling,
 extra `audit-service` instances sit idle — Kafka never assigns more than one consumer per
 partition within a group. Rebalancing on instance join/leave briefly pauses affected
