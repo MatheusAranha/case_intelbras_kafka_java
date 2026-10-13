@@ -20,7 +20,7 @@ public class OtherEventListener {
         this.useCase = useCase;
     }
 
-    @KafkaListener(topics = KafkaTopics.DEVICE_OTHER_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "3")
+    @KafkaListener(topics = KafkaTopics.DEVICE_OTHER_EVENTS, groupId = KafkaTopics.CONSUMER_GROUP, concurrency = "${app.kafka.listener-concurrency}")
     public void onMessage(ConsumerRecord<String, String> record) {
         IncomingDeviceEvent event = parser.parse(record.value());
         useCase.execute(event, new KafkaMessageContext(record.topic(), record.partition(), record.offset(), record.key()));

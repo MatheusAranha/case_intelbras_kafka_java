@@ -24,6 +24,13 @@ spring:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       auto-offset-reset: earliest
+app:
+  kafka:
+    # Raising topic-partitions on an existing topic adds partitions (Kafka can't shrink them),
+    # which remaps deviceId keys to new partitions — per-device ordering only holds from then on.
+    topic-partitions: ${KAFKA_TOPIC_PARTITIONS:3}
+    # Threads per listener; anything above topic-partitions sits idle.
+    listener-concurrency: ${KAFKA_LISTENER_CONCURRENCY:3}
 management:
   endpoints:
     web:
