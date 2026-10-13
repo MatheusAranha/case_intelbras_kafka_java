@@ -65,7 +65,9 @@ services:
       app:
         condition: service_healthy
     ports: ["9090:9090"]
-    volumes: ["./observability/prometheus.yml:/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml
 
   grafana:
     image: grafana/grafana:11.2.0
