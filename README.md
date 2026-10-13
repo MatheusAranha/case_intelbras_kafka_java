@@ -21,11 +21,15 @@ assuming no prior familiarity with this codebase.
 | RF01 — read/dispatch CSV events | `POST /events/simulate` → `SimulateIngestionUseCase` |
 | RF02 — publish to Kafka | `KafkaEventPublisherAdapter`, topic-per-`EventCategory` |
 | RF03 — consumer(s) | 4 `@KafkaListener`s in the `audit` domain |
-| RF04 — handle different event types without one bad message blocking others | per-row CSV tolerance + per-category handlers + DLQ |
+| RF04 — handle different event types in the dataset | `EventCategory` groups the dataset's 11 raw `msgType` values into 4 categories, one handler per category |
 | RF05 — logs to track processing | `ExecutionLog` — one structured log line per use-case execution |
-| RT01–RT04 — Java, Kafka, clear responsibilities, error handling | hexagonal architecture, see below |
+| RT01 — backend in Java | Java 21, Spring Boot |
+| RT02 — use of Apache Kafka | 4 topics + 4 `.DLT` topics, `spring-kafka` |
+| RT03 — clear organization of responsibilities/components | hexagonal architecture (ports & adapters), domain-per-feature (`device`/`audit`), see below |
+| RT04 — error handling without interrupting global processing | per-row CSV tolerance + per-message retry/DLQ: one bad message never blocks a partition beyond its retry budget |
 | RT05 — idempotency / duplicate handling | `eventId` dedup key + DB unique constraint, proven in `AuditFlowIT` |
-| RT06 — automated tests | 43 tests: unit (no infra) + Testcontainers integration test |
+| RT06 — automated tests | 80 tests: unit (no infra) + two Testcontainers integration tests (`AuditFlowIT`, `RandomEventStreamFlowIT`) |
+| "Real scenario may reach millions of events/day" (§2) | `POST /events/random-stream/start` — configurable-rate synthetic load generator built to push the pipeline past consumer capacity on demand, see Step 7b |
 | Architecture write-up (scaling, partitioning, consumer groups, ordering, idempotency, retry, observability, fault tolerance) | `ARCHITECTURE.md` |
 | Technical decisions & trade-offs | `DECISIONS.md` |
 | Bonus: git history, Docker Compose, metrics/observability, Kafka integration tests | all four done — see below |
@@ -59,8 +63,10 @@ and the production-scale discussion are in `ARCHITECTURE.md`.
 ### Testing & quality
 
 - **Unit tests**: pure domain logic (`core/`), handlers, dedup-key generation, CSV field mapping — no infrastructure required.
-- **Integration test** (`AuditFlowIT`, Testcontainers — real Kafka + Postgres): proves the happy path (104 published → 100 audited), that duplicates are truly skipped (asserts the `device_events_duplicate_total` counter increments, not just that the audit count happens to stay flat — a weaker assertion could pass even with broken dedup), and that the 4 synthetic rows land on their dead-letter topics with zero audit rows.
-- **43/43 tests pass**, confirmed stable across repeated full-suite runs.
+- **Integration tests** (Testcontainers — real Kafka + Postgres):
+  - `AuditFlowIT` proves the happy path (104 published → 100 audited), that duplicates are truly skipped (asserts the `device_events_duplicate_total` counter increments, not just that the audit count happens to stay flat — a weaker assertion could pass even with broken dedup), and that the 4 synthetic rows land on their dead-letter topics with zero audit rows.
+  - `RandomEventStreamFlowIT` proves the random event stream (Step 7b) really publishes through the full pipeline into real audit rows, and that a forced `duplicateRate=1.0` keeps audit growth well below the requested count.
+- **80/80 tests pass**, confirmed stable across repeated full-suite runs.
 - Built test-first throughout: every production class has a test that was watched fail before the code existed.
 
 ### Independent code review
@@ -401,8 +407,8 @@ curl -X POST http://localhost:8080/events/random-stream/stop
 
 ### Step 8 — Run the tests locally
 
-This requires Java 21, Maven, and Docker running (the test suite includes a
-Testcontainers-based integration test that spins up real Kafka and Postgres
+This requires Java 21, Maven, and Docker running (the test suite includes two
+Testcontainers-based integration tests that spin up real Kafka and Postgres
 containers — separate from the `docker compose` stack above, so you don't need to stop
 that first).
 
@@ -412,16 +418,17 @@ that first).
 mvn test
 ```
 
-Expected, after ~35 seconds:
+Expected:
 
 ```
-Tests run: 43, Failures: 0, Errors: 0
+Tests run: 80, Failures: 0, Errors: 0
 BUILD SUCCESS
 ```
 
-This runs every unit test (pure logic, instant) plus `AuditFlowIT`, which really spins
-up Kafka and Postgres in Docker, really runs the full ingestion → Kafka → consumption →
-audit flow, and asserts on it — not mocks.
+This runs every unit test (pure logic, instant) plus two integration tests: `AuditFlowIT`,
+which really spins up Kafka and Postgres in Docker and runs the full ingestion → Kafka →
+consumption → audit flow, and `RandomEventStreamFlowIT`, which does the same for the
+random event stream (Step 7b) — both assert on real behavior, not mocks.
 
 ### Step 9 — Shut everything down
 
