@@ -297,6 +297,20 @@ updating in real time as you trigger more ingestions.
 
 Prometheus's own UI (for writing ad-hoc queries) is at **http://localhost:9090**.
 
+**Example debugging query:** the random event stream's dispatch loop
+(`RandomEventStreamScheduler.dispatchOne`) deliberately swallows publish failures
+without logging them — a single slot failing must never stop the stream, and
+`/status`'s `requestedCount` vs `publishedCount` gap is the intended signal. To watch
+that gap live instead of re-polling `/status`, run this in the Prometheus Graph tab:
+
+```promql
+rate(random_stream_requested_total[1m]) - rate(random_stream_published_total[1m])
+```
+
+A flat line around 0 means every requested event is actually reaching Kafka. A
+sustained positive value means publishes are failing under the hood (producer buffer
+full, broker unreachable, serialization error) with nothing else surfacing it.
+
 ### Step 6 — Prove idempotency (duplicate handling)
 
 Run the exact same ingestion again:
