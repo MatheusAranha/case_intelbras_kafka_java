@@ -10,6 +10,10 @@ This README has two parts: a **project review** (what was built, how, and how it
 validated) and a **step-by-step guide** to actually run it, use it, and test it,
 assuming no prior familiarity with this codebase.
 
+**Related projects** (separate repos, not part of this submission's deliverables):
+- [case_intelbras_frontend](https://github.com/MatheusAranha/case_intelbras_frontend) — a simple React/Vite UI: an audit timeline and controls for the random event stream below.
+- [case_intelbras_infra](https://github.com/MatheusAranha/case_intelbras_infra) — an AWS infrastructure-as-code proposal (Terraform, not applied) for this backend, with cost and capacity estimates.
+
 ---
 
 ## Part 1 — Project Review
@@ -198,8 +202,10 @@ interact with the running app directly.
 docker compose up -d --build
 ```
 
-(This is exactly what `./run.sh` does first, plus the health-wait and demo trigger
-below — use whichever you prefer.)
+(This is exactly what `./run.sh` does, plus the health-wait below — use whichever you
+prefer. Either way, this step only starts the stack; it does **not** publish the CSV
+dataset — that's Step 3, done separately and deliberately, so you can start everything
+and inspect an empty `/audits` before triggering ingestion.)
 
 This single command builds the application image and starts five containers: Kafka,
 Postgres, the application, Prometheus, and Grafana. The first run takes a minute or two
@@ -224,6 +230,9 @@ plus 4 clearly-labeled synthetic ones) and publish every row to Kafka:
 ```bash
 curl -X POST http://localhost:8080/events/simulate
 ```
+
+Or, if you have [case_intelbras_frontend](https://github.com/MatheusAranha/case_intelbras_frontend)
+running, click its "Publish CSV" button — same endpoint, same effect.
 
 You should see exactly:
 
